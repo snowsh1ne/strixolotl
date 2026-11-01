@@ -1,6 +1,6 @@
 # SSD speed and decode speed on Strix Halo
 
-As of 2026-10-28 (Samsung 990 Pro, plain and DSpark measured). Older live version: <https://claude.ai/artifact/DAdnoXvN6xSmk7wDjXf8om>
+As of 2026-10-28 (Samsung 990 Pro, plain and DSpark measured). 
 
 DeepSeek-V4.1-Flash decode on a 128 GB Strix Halo is drive-bound: the experts (243 GB) do not fit in RAM, so every
 token reads some of them from the NVMe. Measured on a **Samsung 990 Pro 1 TB** (PCIe 4.0 x4): **~9 tok/s plain** and
@@ -95,7 +95,7 @@ Measured:
 
 Estimated:
 
-- A second drive (990 Pro) is now measured and matches the token budget; RAID 0 and other drives are not tested. The table assumes ~0.5 ms overhead per miss and the same miss count.
+- The 990 Pro is measured and matches the token budget; RAID 0 and other drives are not tested. The table assumes ~0.5 ms overhead per miss and the same miss count.
 - The miss count assumes 128 GB of RAM; less RAM means more misses.
 - Long new prompts also read experts from the SSD, so prefill should speed up too, by an amount not measured.
 

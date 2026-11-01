@@ -9,7 +9,6 @@
 /sess
 /docs/RENAME_CHECKLIST.md
 /docs/GITHUB_PREP.md
-/scripts/paths/V41-1017-kingston.paths
-/scripts/paths/V41-1017-200.paths
+/scripts/paths/
 __pycache__/
 *.pyc

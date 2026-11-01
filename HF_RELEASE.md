@@ -21,8 +21,8 @@ From <https://huggingface.co/docs/hub/storage-limits> (read 2026-10-25):
   Huge files are not cached by the CDN. The GGUF (243.1 GB) is under the hard limit but over the recommendation,
   so it goes up in 10 GiB parts: small resume units, and only one part of local disk in copy mode.
 - **Storage:** free accounts get "best-effort" public storage and 100 GB of private storage. PRO gets up to 10 TB of
-  public storage. A 243 GB **private** repo does not fit a free account's 100 GB. Decided (2026-10-25): PRO (1 TB
-  private included, $18/TB/month above), upload private, polish, then switch to public in the repo settings.
+  public storage. A 243 GB **private** repo does not fit a free account's 100 GB. A private release needs PRO (1 TB
+   private included, $18/TB/month above); upload private, polish, then switch to public in the repo settings.
   While private only you (or members of an org that owns it) can download; a replaced part keeps counting
   against storage until the history is squashed.
 - **Commits:** under 100 files per commit recommended; `hf upload` splits large folders by itself.
@@ -32,8 +32,8 @@ From <https://huggingface.co/docs/huggingface_hub/guides/upload> (huggingface_hu
   an interrupted upload skips committed files and already-uploaded chunks.
 - `HF_XET_HIGH_PERFORMANCE=1` uses all bandwidth and cores. Upstream Xolotl saw timeouts on a home uplink and used
   `HF_XET_FIXED_UPLOAD_CONCURRENCY=3` (`xolotl/tools/v41/hf/upload-start.sh`).
-- The CLI is `hf` (`hf auth login`, `hf repos create`, `hf upload`, `hf download`). The host's old
-  `huggingface-cli` 0.30.2 is not used; run everything below inside `toolbox enter xolotl-strix`.
+- The CLI is `hf` (`hf auth login`, `hf repos create`, `hf upload`, `hf download`). Use `hf` from the
+  toolbox, not an older host `huggingface-cli`; run everything below inside `toolbox enter xolotl-strix`.
 
 ## Steps
 
@@ -41,12 +41,12 @@ From <https://huggingface.co/docs/huggingface_hub/guides/upload> (huggingface_hu
 
 - Wait until nothing else needs the NVMe: `hf_prepare` reads the whole 243 GB GGUF once (~2-4 min), and the upload
   reads it again. Don't run either while a long test or a speed measurement is running.
-- Disk: on strixhalo (btrfs) the parts are reflinks of the GGUF: no extra space. On other filesystems the upload
+- Disk: on btrfs (or xfs with reflink) the parts are reflinks of the GGUF: no extra space. On other filesystems the upload
   cuts one part at a time (~11 GB free needed).
 
 ### 2. Account, token, repo
 
-1. Create or log in to the Hugging Face account that will own the repo (the release: `Snowsh1ne`).
+1. Create or log in to the Hugging Face account that will own the repo.
 2. Settings -> Access Tokens: create a token with **write** access (a fine-grained token limited to the new repo is
    enough).
 3. Create the model repo, on the website (New -> Model) or from the toolbox:
@@ -56,7 +56,7 @@ From <https://huggingface.co/docs/huggingface_hub/guides/upload> (huggingface_hu
    hf auth whoami
    hf repos create <hf-user>/<repo>                # public; add --private only with PRO (see the limits above)
    ```
-   The release repo: `Snowsh1ne/DeepSeek-V4.1-Flash-1017-GSQ-217-Strixolotl` (private until the GitHub release).
+   This release: `Snowsh1ne/DeepSeek-V4.1-Flash-1017-GSQ-217-Strixolotl`.
 
 ### 3. Fill the model card
 
@@ -66,9 +66,8 @@ Edit `hf/MODEL_CARD.md` (it becomes the repo's `README.md`). Fill or remove ever
 grep -n TODO hf/MODEL_CARD.md
 ```
 
-- the Strixolotl GitHub URL (twice) and the HF repo id in the run instructions
-- the long-context line (the main session fills it after the 1M test, or delete it)
-- links for strixite and halogen in the credits
+- the Strixolotl GitHub URL and the HF repo id in the run instructions
+- the measured numbers, if you changed the build or the model
 
 `hf_prepare` and `hf_upload` warn while TODOs are left. A card edit after the upload only needs `hf_prepare` (cached
 hashes, seconds) and `hf_upload` again: the small files are re-sent on every run.
@@ -76,7 +75,7 @@ hashes, seconds) and `hf_upload` again: the small files are re-sent on every run
 ### 4. Build the upload folder
 
 ```bash
-cd ~/projects/Xolotl_StrixHalo
+cd <your clone of strixolotl>
 scripts/hf_prepare --dry-run      # the plan: 23 parts, the small files, the free space
 scripts/hf_prepare                # hashes the GGUF once, writes ~/.cache/xolotl/hf-release/V41-1017-GSQ-217/
 ```
@@ -111,19 +110,17 @@ tail -f ~/.cache/xolotl/hf-upload.log
   `~/.cache/huggingface/xet/<endpoint>/` aside and re-run with `HF_XET_DEDUPLICATION_GLOBAL_DEDUP_QUERY_ENABLED=false`
   (no loss: a new model has nothing to dedupe against).
 - Time: the upload is limited by your uplink. 243 GB take ~5.4 h at 100 Mbit/s and ~33 min at 1 Gbit/s, plus overhead.
-- **Plan (2026-10-27): upload directly from strixhalo** over the home uplink (40 Mbit/s = 5 MB/s): ~13.5 h at line
-  rate, realistically 15-16 h, so start it in the evening and let it run into the next day (resumable). The GGUF now
-  sits on the 990 Pro's ext4, so `hf_prepare` uses copy mode: each 10 GiB part is cut just before its upload and
-  deleted after it (~10 GiB free needed). The upload fills the uplink: remote use of the server over Tailscale gets
-  laggier while it runs.
+- On a home uplink (e.g. 40 Mbit/s = 5 MB/s) that is ~13.5 h at line rate, realistically 15-16 h: start it in the
+  evening and let it run (resumable). On ext4, `hf_prepare` uses copy mode: each 10 GiB part is cut just before its
+  upload and deleted after it (~10 GiB free needed).
 
-### 5b. Alternative, not planned: upload from another machine (external SSD)
+### 5b. Alternative: upload from another machine (external SSD)
 
 Only if the direct upload is not an option: carry the upload folder to a faster connection. What travels: the folder from
-step 4 (23 parts, 243.1 GB, plus ~6 MB of small files) and the three upload scripts. The GGUF itself stays home.
+step 4 (23 parts, 243.1 GB, plus ~6 MB of small files) and the three upload scripts. The GGUF itself stays on the box.
 
-1. On strixhalo, after step 4: plug in an external SSD with at least 256 GB free, formatted ext4 (Linux) or exFAT
-   (any OS; not FAT32, which stops at 4 GB per file). Copy the folder and the scripts (the parts are reflinks at home,
+1. On the box with the GGUF, after step 4: plug in an external SSD with at least 256 GB free, formatted ext4 (Linux) or exFAT
+   (any OS; not FAT32, which stops at 4 GB per file). Copy the folder and the scripts (the parts are reflinks on the box,
    so this reads 243 GB from the NVMe; ~5-10 min over USB 10 Gbit/s, longer over slower links):
 
    ```bash
@@ -150,7 +147,7 @@ step 4 (23 parts, 243.1 GB, plus ~6 MB of small files) and the three upload scri
    command after any interruption; parts already on the Hub are skipped. `HF_XET_HIGH_PERFORMANCE=1` uses the whole
    connection.
 
-3. Back home, delete the upload folder (step 7) once `scripts/download_model` has verified the repo (step 6).
+3. Back on the box, delete the upload folder (step 7) once `scripts/download_model` has verified the repo (step 6).
 
 ### 6. Check the repo
 
@@ -162,8 +159,8 @@ scripts/download_model --repo <hf-user>/<repo> --dry-run     # reads the manifes
 
 - On the website: 23 parts, sizes 10.7 GB each (the last 6.9 GB), the model card renders, the license shows "mit",
   "Quantized from deepseek-ai/DeepSeek-V4.1-Flash-1017" appears.
-- A full download test needs ~460 GB free and must not overwrite the live files. strixhalo has ~238 GB free, so do
-  it on another box, or point it at another disk: `XOLOTL_MODELS=/other/disk scripts/download_model --repo ...`.
+- A full download test needs ~460 GB free and must not overwrite the live files: do it on another box, or point it
+  at another disk: `XOLOTL_MODELS=/other/disk scripts/download_model --repo ...`.
   Then `XOLOTL_MODELS=/other/disk scripts/verify_setup` (host; the server stopped) must PASS with 32/32 tokens.
 - Spot check without the full download: fetch one part and compare its sha256 with `SHA256SUMS`:
   ```bash
@@ -174,8 +171,7 @@ scripts/download_model --repo <hf-user>/<repo> --dry-run     # reads the manifes
 ### 7. Publish
 
 - If the repo is private: Settings -> make it public.
-- Put the repo id into `README.md` and `QUICKSTART.md` (the `<hf-user>/<repo>` placeholders) and, if you want, as the
-  default of `scripts/download_model --repo`.
+- Optionally make the repo id the default of `scripts/download_model --repo`.
 - Delete the upload folder when done: `rm -rf ~/.cache/xolotl/hf-release/V41-1017-GSQ-217` (reflinked parts are
   deleted after upload anyway; they share the GGUF's extents).
 

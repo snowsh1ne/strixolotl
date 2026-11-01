@@ -7,8 +7,8 @@ it is not published. Numbers come from one box: Minisforum MS-S1 MAX (Ryzen AI M
 
 ## Where it stands (2026-10-31)
 
-The port, the quantization and the performance work are done and frozen. The next steps are the public GitHub
-release and opening the Hugging Face repo.
+The port, the quantization and the performance work are done and frozen. This repository is the public release;
+the Hugging Face repo opens with it.
 
 | | DSpark (default) | plain decode (`--no-dspark`) |
 |---|---|---|
@@ -177,8 +177,7 @@ Every change in `xolotl/` is marked `strix-port:` in the code. The main ones:
 ## Roadmap
 
 **Next**
-1. Public GitHub release of this repository.
-2. Hugging Face repo public: GitHub link in the card, a test download from a clean folder.
+1. Hugging Face repo public, after a test download from a clean folder.
 
 **Parked (not planned; measured or estimated where noted)**
 - Prefill: prediction buffer inside the decode arena extension (would remove its decode cost); a faster on-demand

@@ -5,13 +5,13 @@ Scope: the prompt path of `ds41_generate --serve` (DeepSeek-V4.1-Flash GSQ-217, 
 2026-10-28 analysis (a report, no engine change). The 2026-10-29 night built #1-#4 and #7: the next section. Tools are
 in `scripts/dev/prefill/`, and run logs are in `~/.cache/xolotl/runs/prefill/`.
 
-## Night 2026-10-29: built and measured (read this first; §0-§7 below are the 10-28 analysis)
+## 2026-10-29: built and measured (read this first; §0-§7 below are the 10-28 analysis)
 
-**Status 2026-10-30: FROZEN** (user: optimization and research done, no more test runs). Defaults: fused key gather,
+**Status 2026-10-30: FROZEN.** Defaults: fused key gather,
 driver-free settle, predicted reads (start script; `--no-pred-reads` = off). Optional: `--fast-prefill`. Not set:
 `STRATA_SERVE_DSPARK_EVICT=8193`. The "Open / next" list at the end of this section is parked, not planned.
 
-All numbers are measured on strixhalo on 2026-10-29 22:00-00:15. Same binary for the A/B pairs, the served `--long --dspark`
+All numbers are measured on the test box on 2026-10-29 22:00-00:15. Same binary for the A/B pairs, the served `--long --dspark`
 config through `scripts/dev/prefill/turns.py` unless a row says plain. Each change has a switch, so the old path still
 runs from the new binary; the old binary is `build-strix/ds41_generate.pre-prefill`. Runs are in
 `~/.cache/xolotl/runs/prefill/{n29*,f29*,p29*}`, the A/B dumps in `runs/ab/nll-{mmq,mq3,mqv,fkv,v2r}-*`, the report is
@@ -105,7 +105,7 @@ sits idle while the dense half runs.
 
 - **Small turns (+0.8-1K) are bound by the drive.** A batch of 844 tokens still routes 10.5-10.8K of the 15,360
   experts. Of those, 5.3-5.8K are in the file tier: 81-88 GB, read at 4.9 GB/s, so 17-18 s. The expert kernels (~10 s)
-  overlap with those reads. The dense half (4.8-7 s in calm runs, 12.7 s in the user's session) runs with the drive
+  overlap with those reads. The dense half (4.8-7 s in calm runs, 12.7 s in the live session (2026-10-28 07:05)) runs with the drive
   idle. This floor hardly moves with turn size: +844 tokens read 5.5K experts and +2.5K read 7.5K. That is why a +844
   turn gets only 26-38 tok/s.
 - **Medium and large turns (+2.5-7K, and cold prompts) are bound by the expert kernel.** The prompt runs the decode
@@ -124,7 +124,7 @@ sits idle while the dense half runs.
 | 3 | **File reads off the dense critical path** (layer-ahead whole-layer prefetch for big batches; progressive / predicted reads for small ones) | −3…−6 s | −5…−10 s | −10…−15 s (measured −14.6 at 4096, MMQ) | −15…−25 s | medium | yes (same bytes) |
 | 4 | **Batch width after the release** (wait for the driver's free figure to settle) | 0 | 0 | 0 | cold 5-8K: −10…−15 s (measured 2 sweeps vs 1); cold 34K: −30…−60 s | ~15 lines | yes, or batch-shape noise |
 | 5 | **Persistent / multi-slot prefix cache** (park to RAM + disk) | – | – | – | repeated / resumed 34K: 398 s → ~2-5 s | medium | yes (exact state restore) |
-| 6 | Faster file reads (file-offset order, no wave barrier; optional 2nd copy on the Kingston) | −2…−4 s | −2…−4 s | −3…−5 s | −5…−8 s | small-medium | yes |
+| 6 | Faster file reads (file-offset order, no wave barrier; optional 2nd copy on a second drive) | −2…−4 s | −2…−4 s | −3…−5 s | −5…−8 s | small-medium | yes |
 | 7 | Keep the arena extension through small turns; keep the DSpark weights when the batch fits; poll the driver at 20 ms | −0.5…−1.5 s | −0.5…−1 s | −1…−2 s | −1 s | env + ~30 lines | yes |
 
 **Estimated TTFT per turn** (§5, estimates built from measured parts):
@@ -165,21 +165,21 @@ The floor for small turns is the drive. A +844 turn has to read ~84 GB of routed
 
   The server was stopped throughout and is stopped now.
 - **Perturbation.**
-  - `hf_upload` (another session) started during base1, request 2, and ran through fixcols, mmq4k, decA and part of
-    decB. It reads the reflinked copy on the Kingston (`~/.cache/xolotl/hf-release`), not the 990: the 990's read
+    - An HF upload ran concurrently from base1, request 2, through fixcols, mmq4k, decA and part of decB. It read a copy
+    on a second drive, not the 990: the 990's read
     MB/s and the reader GB/s were unchanged (4.9 GB/s in every run).
   - KFD queue evictions vary a lot from run to run. base1 logged 7-30 s of `evicted_ms` per turn and kcompactd was
     active; decA/decB logged 0.03-0.6 s. base1 requests 2 and 3 (+2519@16K dense 41.6 s, +6555@18K 124.9 s) are
     perturbed and are not used as baselines.
   - Treat dense seconds as noisy. Kernel µs/pair (GPU events) and reader GB/s were stable across all runs.
-- The user's session (engine log from 07:05) has no eviction data. Its small-turn dense times (12.7-15.3 s for
-  0.8-1K tokens) are about 2x my calm runs at similar depth (4.8-8.6 s). The most likely cause is the same stall
+- The live session (engine log from 07:05) has no eviction data. Its small-turn dense times (12.7-15.3 s for
+  0.8-1K tokens) are about 2x the calm runs at similar depth (4.8-8.6 s). The most likely cause is the same stall
   source, but that is not proven.
 - Measured and estimated numbers are kept separate (§7).
 
 ## 2. Where prefill time goes
 
-### 2a. The user's session (measured, engine log 2026-10-28 07:05, MMVQ, batch 8192)
+### 2a. The live session (measured, engine log 2026-10-28 07:05, MMVQ, batch 8192)
 
 | turn | ctx before | TTFT (prompt s) | dense s | experts s | file reads | token-expert pairs | µs/pair (experts/pairs) |
 |---|---|---|---|---|---|---|---|
@@ -224,7 +224,7 @@ experts' DMAs and the grouped kernels (~250 ms) run underneath. ~0.6-0.7 s × 40
    of those are in the file tier (55-60% of it). That is 81-88 GB, 17-18 s of reader wall time. 22% of these reads
    serve a single token and 47% serve fewer than 4 (`routes.py`). A +2.5K turn reads only 37% more (7.5K) and a +6.5K
    turn 50% more (8.2K).
-2. The dense half with the drive idle: 4.8-7 s in my calm runs, 12.7-15.3 s in the user's session.
+2. The dense half with the drive idle: 4.8-7 s in the calm runs, 12.7-15.3 s in the live session.
 3. ~1 s of overheads: driver wait 0.25 s, and graph alloc 0.5-2.3 s in `STRATA_DENSE_PROF`.
 
 The arena extension is released before every batch, so 223-540 conversation-hot experts that were in RAM go back to
@@ -361,7 +361,7 @@ kernel. On small turns it is the drive sitting idle during the dense half, plus 
 - The cap is computed from the driver's free figure right after `DSpark weights freed` + `arena ext: released`. That
   figure still lags at ≥ 9 GiB, so the 20 s wait loop does not trigger:
   - base1 cold 5.6K: "VRAM 9.65 GiB free → prompt batch 4693".
-  - the user's cold 34K: 9.77 GiB → 4820.
+  - the live session's cold 34K: 9.77 GiB → 4820.
 - **Measured:** the same cold 5.6K prompt ran 99.7 s capped (2 sweeps, 13.3K reads) and 85.2 s uncapped (1 sweep,
   8.3K). Part of that gap is eviction noise.
 - Fix (`ds41_generate.cpp:1549-1560`): after a release, poll every 20 ms until two readings agree within
@@ -395,8 +395,7 @@ kernel. On small turns it is the drive sitting idle during the dense half, plus 
   2-half wave barrier (`cudaStreamSynchronize(s_cp)` before every 140-blob wave) with a slot ring that frees a bounce
   slot as soon as its DMA is done.
 - `STRATA_READ_SORTED` segfaulted on 2026-10-15 and was reverted. Re-implement it, don't re-enable it.
-- Optional: the Kingston holds byte-identical copies (`V41-1017-kingston.paths`). A second reader pool on it (PCIe 4.0
-  x1, ≤ ~1.9 GB/s, with known slow phases) that pulls from the same per-layer queue could add ~25-30% of bandwidth.
+- Optional: a second drive holding a byte-identical copy of the files. A second reader pool on it (PCIe 4.0 x1, ≤ ~1.9 GB/s, with known slow phases) that pulls from the same per-layer queue could add ~25-30% of bandwidth.
   It needs work stealing so that a slow phase only costs its share, and it competes with the OS and HF upload traffic.
 - Estimated saving: 10-20% of read time on read-bound turns (+844 −2…−3 s), up to −30% with the second drive.
   Bit-identical.
@@ -436,10 +435,10 @@ kernel. On small turns it is the drive sitting idle during the dense half, plus 
   HF upload churns the cache.
 - **Ordering by arena residency:** already done (resident → arena DMAs first → file reads in the background).
 
-## 5. What the user would see (estimates)
+## 5. What a user would see (estimates)
 
 The model is TTFT ≈ dense + max(expert kernels, reads not hidden) + ~1-2 s of overheads, built from the measured
-parts in §2-§3. Ranges cover the dense noise (calm vs the user's session) and 70-100% read overlap.
+parts in §2-§3. Ranges cover the dense noise (calm vs the live session (2026-10-28 07:05)) and 70-100% read overlap.
 
 | turn | user (measured) | calm baseline (measured) | 1+4+7 | +2 (fused gather) | +3+6 (overlap, faster reads) |
 |---|---|---|---|---|---|
@@ -477,7 +476,7 @@ Then `--chunk-mmq --prompt-batch 8192` on the warm 14.8K one-shot: no fault, plu
 ```diff
 -                if (uma && frb < (size_t) 9 << 30) {
 +                // strix-port: right after a release (extension / DSpark) the driver's free figure keeps rising for
-+                // ~0.25-1 s even above 9 GiB (cold 5.6K: 9.65 GiB -> batch 4693; the user's 34K: 9.77 -> 4820)
++                // ~0.25-1 s even above 9 GiB (cold 5.6K: 9.65 GiB -> batch 4693; the live session's 34K: 9.77 -> 4820)
 +                const size_t want_b = (size_t) ((4.3 + a.vram_margin_gib) * 1073741824.0 + 0.95 * 1048576.0 * std::min(dh, PB));
 +                if (uma && frb < want_b) {
                      const double tw0 = now_ms();
@@ -531,7 +530,7 @@ logits md5 before and after.
 
 ## 7. Measured vs estimated
 
-**Measured** (logs in `~/.cache/xolotl/runs/prefill/`; the user's session in `~/.local/state/xolotl/logs/ds41-engine.log`):
+**Measured** (logs in `~/.cache/xolotl/runs/prefill/`; the live session (2026-10-28 07:05) in `~/.local/state/xolotl/logs/ds41-engine.log`):
 - Every number in §2a-§2d.
 - The MMVQ µs/pair (46-50) and MMQ µs/pair (7.5-8.0, and 14.5 at 844 rows).
 - Reader 4.9 GB/s; prefetch reader 6.0-6.2 GB/s; `nvbench` 5.3-5.4 GB/s.
@@ -553,7 +552,7 @@ logits md5 before and after.
 - The 34K projections: no 34K run was made.
 - §5 as a whole.
 - The MMQ fault cause: a hypothesis from code reading.
-- Why the user's session had 2x the dense time of my calm runs: likely KFD stalls, but this session did not show it.
+- Why the live session had 2x the dense time of the calm runs: likely KFD stalls, not reproduced in the calm runs.
 
 **Perturbed and not used as baselines:** base1 +2519@16K (30 s evicted) and +6555@18K (23 s evicted). The small turns
 in mmqpf were starved by the 7.8 GB of slabs.

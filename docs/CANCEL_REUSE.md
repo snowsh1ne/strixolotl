@@ -1,7 +1,6 @@
 # DSpark serve: prompt reuse after a cancel (analysis + fix)
 
-Status 2026-10-28: analysis done by reading the code, the patch is written, **nothing built or run** (the server was
-running). The patch is `docs/CANCEL_REUSE.patch`. Apply it from the repo root with `patch -p1 < docs/CANCEL_REUSE.patch`.
+Status 2026-10-28: analysis done by reading the code and the patch written. **Update: applied, built and shipped the same day** (`STRATA_SERVE_DSPARK_RESUME`, on by default; ROADMAP "DSpark"). The patch is `docs/CANCEL_REUSE.patch`. Apply it from the repo root with `patch -p1 < docs/CANCEL_REUSE.patch`.
 It applies cleanly: dry-run against the current tree, plus a real apply to a pristine copy in
 `~/.cache/xolotl/runs/cancel/t`. It has not been compiled.
 
@@ -187,7 +186,7 @@ Needs a build and a run:
 
 ## 7. Test plan (server stopped, MemAvailable >= 110 GiB)
 
-0. `dv -s "pre cancel reuse"`, then back up `build-strix/ds41_generate` to `ds41_generate.pre-cancelreuse`. From the repo
+0. Snapshot your tree, then back up `build-strix/ds41_generate` to `ds41_generate.pre-cancelreuse`. From the repo
    root: `patch -p1 --dry-run < docs/CANCEL_REUSE.patch`, then `patch -p1 < docs/CANCEL_REUSE.patch`, then
    `scripts/build_xolotl`. `ds41_dense.hpp` changes, so more units recompile than usual.
 1. **Plain bit-identity:** `scripts/verify_setup` gives PASS.
@@ -215,7 +214,7 @@ Needs a build and a run:
    - Then compare the 333-token continuations: they should agree to roughly the ~1-3% near-tie level that DSpark already
      has. Large disagreement right after the cut would point at a ring error.
 4. **Optional, odd-extension path (§6.1):** this needs a direct engine run. Use a copy of
-   `xolotl/tools/v41/serve/drive_engine.py` with the strixhalo paths (`start_xolotl_dsv41 --dry-run` prints the engine
+   `xolotl/tools/v41/serve/drive_engine.py` with your paths (`start_xolotl_dsv41 --dry-run` prints the engine
    command), and change its `extend` so it keeps only the first `stop_after` tokens. Sweep `stop_after` over a few odd
    and even values and check every continuation's `req*.f32` against a fresh read of the same ids (an unrelated request
    in between forces `reused=0`).

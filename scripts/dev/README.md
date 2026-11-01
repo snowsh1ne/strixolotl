@@ -1,4 +1,4 @@
-# scripts/dev - engine test harness (from the 2026-10-19..21 sessions)
+# scripts/dev - engine test harness (2026-10-19 onwards)
 
 Run on the Strix Halo only (the host check in QUICKSTART.md). Logs and dumps go to `~/.cache/xolotl/runs/` (local disk).
 
@@ -8,7 +8,7 @@ Run on the Strix Halo only (the host check in QUICKSTART.md). Logs and dumps go 
 | `memwatch.sh LOG` | MemAvailable + GTT used + NVMe temperature every second; kills ds41_generate below `MW_MIN`. |
 | `fidelity.sh` | The fidelity battery (agent4k, quality mode, switches one by one + all). |
 | `sweep.sh` | File-penalty sweep (route bias). |
-| `cmpref.py run...` | Per-token distance of `runs/nll-<run>.txt` dumps to `runs/nll-gsqtorch.txt` (NOTE: that file is a sibling GPTQ run, not the GGUF's model - use the ablation's `nll_E` as the reference, see STATUS "Fidelity: DONE"). |
+| `cmpref.py run...` | Per-token distance of `runs/nll-<run>.txt` dumps to `runs/nll-gsqtorch.txt` (NOTE: that file is a sibling GPTQ run, not the GGUF's model - use the ablation's `nll_E` as the reference, see ROADMAP "Quality A/B"). |
 | `vsT.py run...` | Same vs the teacher (`runs/nll-teacher.txt`) plus pairwise. |
 | `ab_v1v2.sh`, `ab_prep.py`, `ab_report.py` | Quality mode v1 (GSQ-200, no fidelity switches) vs v2 (GSQ-217 + switches): `--ppl` on the 17 held-out rows of both chains vs the teacher, paired per row with a bootstrap CI, plus a speed A/B (6144-token prompt + 1000 forced tokens; v1, v2 and GSQ-200 with the v2 switches). Output `runs/ab/`. Server stopped first. |
 | `ab_speed.sh`, `ab_speed_prep.py`, `ab_speed_chain.py` | Speed-mode sweep phase 1: warm speed bench (held-out ~15K agent prompt + 3000 forced tokens of quality mode's own output, window >= step 1024) for the speed knobs, then their quality on the 17 rows, then restarts the server. Output `runs/ab/warm/`, report in `ab_report.py`. |
@@ -23,7 +23,7 @@ Run on the Strix Halo only (the host check in QUICKSTART.md). Logs and dumps go 
 | `dspark_conf.py NAME..` | Stall-free DSpark numbers from `STRATA_DSPARK_CONFLOG` (`runs/dspark/NAME.conf`): KFD-stalled passes (> 1 s) and the first 8 dropped. |
 | `prefill/` | Prefill / TTFT (docs/PREFILL.md): `turns.py NAME SPEC [args]` (serve turns over the line protocol, `PF_ENV`, `PF_NO_DSPARK`), `report.py NAME..` (per-turn table incl. pred-prefetch use), `ab_mmq.sh CFG [ROWS]` (17-row `--ppl` A/B of prompt-path variants: mmq, mqv, mq3, fkv, v2r) + `ab_cmp.py REF CFG..` (vs REF and the teacher), `routes.py`, `ktsum.py`, `oneshot_prof.sh`, `spec_*.json`. |
 | `serve_ab.py NAME` | 3 fixed requests (prose / code / code at 0.7) against a running server; TTFT + decode from the monitor. |
-| `prefetch/` | MTP-prefetch study scripts (`docs/MTP_PREFETCH.md`). KFD eviction sampler: `~/.cache/xolotl/runs/uma/evmon.sh` (`/sys/class/kfd/kfd/proc/<pid>/stats_*/evicted_ms`). |
+| `prefetch/` | MTP-prefetch study scripts (`docs/MTP_PREFETCH.md`). KFD eviction sampler: `uma/evmon.sh OUT` (`/sys/class/kfd/kfd/proc/<pid>/stats_*/evicted_ms`). |
 | `nvme/warm.sh NAME N [args]` | The warm speed bench (ab_speed.sh's `srun`, quality mode, arena 86 GiB) for N decode steps; extra engine env `XENV="A=1 B=2"`. Log `runs/nvme/NAME.log`. |
 | `nvme/win.py [--from N] [--to N] LOG..` | Windowed tok/s, misses/token, stage ms and the `file-tier profile` line (DS4_TIER_PROF) of warm-bench logs (default window 1024..end). |
 | `nvme/vadapt.sh NAME N "ENV" [args]` | verify_setup's engine run (its prompt/env/arena 80) for N greedy tokens with extra env/args (e.g. `--arena-adapt`) + a decode trace; checks the first 32 tokens against `verify_setup.ref`. |

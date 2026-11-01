@@ -25,7 +25,7 @@ A quantization of [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/
 **Strixolotl** (Xolotl on Strix Halo): a HIP/ROCm port of the [Xolotl](https://github.com/Indras-Mirror/Xolotl)
 engine that runs the whole model on one AMD Ryzen AI Max (Strix Halo, gfx1151) box with 128 GB of unified memory.
 
-Strixolotl repo: the GitHub link follows with the public release.
+Strixolotl repo: <https://github.com/snowsh1ne/strixolotl>.
 
 This file is **not** a llama.cpp, Ollama or LM Studio GGUF. Its experts use per-expert quantization types those
 runtimes do not load. Use it with Strixolotl.
@@ -112,7 +112,7 @@ temperature, but it is not bit-identical to plain greedy decode (~1.4% of greedy
 ## How to run
 
 ```bash
-git clone <Strixolotl repo URL (follows)> strixolotl && cd strixolotl
+git clone https://github.com/snowsh1ne/strixolotl strixolotl && cd strixolotl
 scripts/toolbox_create                                   # the xolotl-strix toolbox (ROCm 7.14)
 toolbox run -c xolotl-strix scripts/build_xolotl         # the engine, 20-30 min the first time
 toolbox run -c xolotl-strix scripts/download_model --repo Snowsh1ne/DeepSeek-V4.1-Flash-1017-GSQ-217-Strixolotl

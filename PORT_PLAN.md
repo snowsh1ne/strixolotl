@@ -9,7 +9,7 @@
 
 Target: Ryzen AI Max+ 395, Radeon 8060S (`gfx1151`, RDNA3.5, wave32), 128 GB unified LPDDR5X (~256 GB/s
 theoretical, ~226-240 GB/s measured by strixite / halogen). Source: [Indras-Mirror/Xolotl](https://github.com/Indras-Mirror/Xolotl) (
-Strata fork merged at 0.1.44.1). Nothing here has been built or run; the dev server cannot run it.
+Strata fork merged at 0.1.44.1). Nothing here had been built or run at the time.
 
 ## 1. Backend decision: HIP (ROCm), not Vulkan
 
@@ -47,7 +47,7 @@ pageable mmap'd expert memory.
 - **Kernel cmdline:** `amdgpu.gttsize=126976 ttm.pages_limit=32505856 amd_iommu=off` (~124 GiB GTT).
   - `amd_iommu=off` gives +1-12%, but it disables the NPU and DMA isolation.
   - The Strata doc uses `ttm.pages_limit=29360128` (112 GiB), which leaves more room for the host. Start there.
-- **Kernel:** 6.18.5+ or 7.0. The user needs to be in `render` and `video`.
+- **Kernel:** 6.18.5+ or 7.0. Your user account needs to be in `render` and `video`.
 - **Environment:** set no `HSA_OVERRIDE_GFX_VERSION`, since a native gfx1151 build needs none.
   - Set `HSA_DISABLE_COREDUMP_ON_EXCEPTION=1`; otherwise a GPU fault dumps memory into the working directory.
   - Raise `ulimit -l` (memlock) to unlimited.
@@ -82,7 +82,7 @@ Wave32 matches the code's 32-lane assumptions.
 
 ## 5. Phases
 
-Each phase ends with a build + `ctest` + token-id gate run **on the target**, then a `dv -s` checkpoint here.
+Each phase ends with a build + `ctest` + token-id gate run **on the target**, then a checkpoint.
 
 **Phase 0: core baseline on gfx1151.**
 - Fix the HIP-branch `mmq_types.inc` generation.

@@ -9,8 +9,7 @@
 /HANDOFF.md              # session hand-off notes (internal)
 /docs/RENAME_CHECKLIST.md   # local rename plan (NAS paths, memory folders)
 /docs/GITHUB_PREP.md     # this release's own preparation notes
-/scripts/paths/V41-1017-kingston.paths   # this box's old drive layout
-/scripts/paths/V41-1017-200.paths        # GSQ-200, not released
+/scripts/paths/          # this box's own .paths files (download_model writes the user's)
 + /xolotl/bench/micro/   # the only part of upstream's bench/ the build uses (tests, parity fixtures)
 /xolotl/bench/*          # upstream's benchmark data (74 MB, other models / hardware; mostly binary): see upstream
 /xolotl/tools/taskeval/he/   # upstream's HumanEval dataset copy: its own Git LFS rules and only an LFS pointer, no data

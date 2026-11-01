@@ -30,7 +30,7 @@ runs below). Data: `~/.cache/xolotl/runs/prefetch/` (local disk).
 | R4 `pf-r4-plain` | plain decode, warm prompt, 400 tokens, `STRATA_DEC_TRACE` + `STRATA_DUMP_MAIN` + `STRATA_FILE_PRED=1` (late-state proxy, §3.4) | `r4.*` |
 
 All four engine runs used `flock ~/.cache/xolotl/gpu.lock`. DSpark is deterministic at a fixed config: R1's 400 tokens
-are identical to the first 400 of tonight's `iq3-c06` run.
+are identical to the first 400 of the 2026-10-28 `iq3-c06` run.
 
 ## 2. Where the file wait sits in a verify pass (measured, R1)
 
@@ -43,7 +43,7 @@ are identical to the first 400 of tonight's `iq3-c06` run.
 - Misses by the first pass row that routes them: row 0 29%, 1 27%, 2 20%, 3 14%, 4 10%. **11-12% of the misses come only from
   rejected draft rows**: experts read for rows that are then thrown away. A rejected row's experts are admitted to the
   arena, so when the next pass routes them they are already hits. DSpark already acts as a small prefetcher.
-- Per-call profile (`DS41_PROF_X=2`, tonight's c06b): launch 3.74 ms of which ~3.5 is waiting for the file reads, sum+sync
+- Per-call profile (`DS41_PROF_X=2`, the 2026-10-28 c06b): launch 3.74 ms of which ~3.5 is waiting for the file reads, sum+sync
   1.54 ms, classify/xq 0.05 ms. With no file wait a layer's tier would be ~1.8 ms + whatever hit-kernel GPU time the
   reads now hide (unknown, ≤ ~1 ms).
 - The drive is busy ~38% of a pass (48 × 2.5 ms of ~310 ms), but only while a layer waits on it. The ~62% idle time is the
@@ -131,7 +131,7 @@ it for the next position), rms-normed, through layer L's router, top N.
 
 Even the true late state of the same token predicts the early and middle layers' routing hardly better than chance,
 and only reaches 5% precision at the top. A drafter hidden state (an approximation of that state, for the next
-position) through the trunk routers is dead as a predictor. R4 also confirms the router-ahead numbers on tonight's
+position) through the trunk routers is dead as a predictor. R4 also confirms the router-ahead numbers on the 2026-10-28
 config (r1.4: 37% recall / 30% precision vs T1's 33 / 25%). `tok` is weak in R4 (1.9% at 6) because 400 steps give
 little history: the T1 values need ~1000+ decoded tokens of history.
 
@@ -276,11 +276,12 @@ gain then shrinks, §4).
 ```
 cd scripts/dev/prefetch          # python3 -B everywhere (no __pycache__ in the repo)
 R=~/.cache/xolotl/runs
+G=<folder of V41-1017-GSQ-217.gguf>
 python3 -B pred.py $R/nvme/T1.trace $R/ab/warm/force.ids --emb $R/prefetch/emb.npz --passes $R/prefetch/r1.conf --json $R/prefetch/t1_pred.json
-python3 -B emb_router.py /mnt/fast/V41-1017-GSQ/V41-1017-GSQ-217.gguf $R/ab/warm/force.ids $R/prefetch/emb.npz
+python3 -B emb_router.py $G/V41-1017-GSQ-217.gguf $R/ab/warm/force.ids $R/prefetch/emb.npz
 python3 -B rtrace.py $R/prefetch/r1.rtrace --from-pass 20
 python3 -B timeline.py $R/nvme/T1.trace $R/ab/warm/force.ids $R/prefetch/r1.conf --stash 64 --parts 4 --pred-ms 0.05 [--admit 1] [--read-ms 1.25]
-python3 -B main_proxy.py /mnt/fast/V41-1017-GSQ/V41-1017-GSQ-217.gguf $R/prefetch/r4.trace $R/prefetch/r4.main
+python3 -B main_proxy.py $G/V41-1017-GSQ-217.gguf $R/prefetch/r4.trace $R/prefetch/r4.main
 ```
 Engine runs (each under `flock ~/.cache/xolotl/gpu.lock`): `runs/prefetch/r1.sh`, `r23.sh`, `r4.sh` (`dspark_ab.sh`, warm
 prompt, ARENA=80, 400 tokens).

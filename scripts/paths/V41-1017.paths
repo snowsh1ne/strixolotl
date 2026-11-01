@@ -1,9 +1,0 @@
-# written 2026-10-27: GSQ-217 + Engram on the Samsung 990 Pro (/mnt/fast, ext4, PCIe 4.0 x4); byte-identical copies
-# of the Kingston files (kept: V41-1017-kingston.paths points at them). GSQ-200: V41-1017-200.paths
-XOLOTL_DSV41_NAME=V41-1017
-XOLOTL_DSV41_REPO=local
-XOLOTL_DSV41_GGUF="/mnt/fast/V41-1017-GSQ/V41-1017-GSQ-217.gguf"
-XOLOTL_DSV41_RANK="/mnt/fast/V41-1017-GSQ/rank-217.bin"
-XOLOTL_DSV41_TOKENIZER="/mnt/fast/V41-1017-GSQ/tokenizer"
-XOLOTL_DSV41_ENGRAM="/mnt/fast/engram"
-XOLOTL_DSV41_DSPARK="/mnt/fast/V41-1017-MTP/V41-1017-MTP.IQ3_XXS.gguf"   # MTP sidecar, experts IQ3_XXS (v41_sidecar_requant of V41-1017-MTP.gguf, 2026-10-28); only with --dspark

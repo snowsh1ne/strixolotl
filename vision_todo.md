@@ -1,6 +1,6 @@
 # Vision input for DeepSeek-V4.1-Flash-1017: plan
 
-Status: plan only, nothing built or run. Researched 2026-10-25 on `strixhalo` while the 1M-context benchmark was running
+Status: plan only, nothing built or run. Researched 2026-10-25 on the test box while the 1M-context benchmark was running
 (read-only: code, configs, safetensors headers, `podman image inspect`, `/sys`, `lsmod`, `journalctl -k`, web pages).
 "(est.)" marks an estimate that has not been measured.
 
@@ -24,7 +24,7 @@ Status: plan only, nothing built or run. Researched 2026-10-25 on `strixhalo` wh
 - **Recommendation:** first get correct images end to end with the CPU encoder (option B: existing code, BF16 weights
   loaded straight from the checkpoint). Then move the encoder to the GPU through llama.cpp's `deepseek4v` mtmd graph,
   which is already in our pinned llama.cpp and needs a V4.1 layout patch (option D). Keep the NPU (option A) as a
-  separate experiment, only if the user agrees to turn the IOMMU back on.
+  separate experiment, only if turning the IOMMU back on is acceptable.
 
 ## 2. Architecture facts (from the checkpoint's reference code and headers)
 
@@ -133,12 +133,9 @@ idle GPU with option D is faster.
   and `QUICKSTART.md` already note that `amd_iommu=off` (+1-12% GPU) turns the NPU off.
 - No XRT, xrt-npu or Ryzen AI packages are installed (`rpm -qa`).
 
-**Halogen as installed here is GPU-only:**
-- Images `ghcr.io/peonist-ai/halogen-flash-server:{0.6.1,0.11.10,0.12.1}` and the `localhost/llama-strix-halogen-flash*`
-  toolboxes: their ENV and build history show only ROCm 7.14.0 wheels + `flash_serve`. No XRT layer, no NPU variables.
-- Its vision tower (`~/models/Qwen3.8-NEXT_HALOGEN/qwen38-flash-next-vision.hgn`, 0.84 GiB) runs on the GPU. See
-  `~/logs/halogen-sidecar-test-20260919-211153.log`: "vision tower configured, 1.97 GiB (0.84 resident weights + 1.14
-  worst-case scratch)", charged against the KV pool.
+**Halogen's GPU build is GPU-only:** its images (`ghcr.io/peonist-ai/halogen-flash-server`) carry only ROCm 7.14.0
+wheels and `flash_serve`, no XRT layer or NPU variables. Its vision tower (0.84 GiB of weights, 1.97 GiB with
+worst-case scratch) runs on the GPU and is charged against the KV pool.
 
 **Halogen upstream** (`docs/NPU.md`, `docs/npu-small-models.md`, `docker-compose.npu.yml`, example tag 0.18.15):
 - What runs on the NPU: small models next to the Flash model. `decider-0.8b/4b` (classifier/decisions), `d3-lite/nano`
@@ -231,13 +228,13 @@ idle GPU with option D is faster.
 | 5 | Expert check: VL-heavy experts may sit in low tiers, because the 1017 tier map was calibrated on text. Log routed experts for image tokens; compare with `alloc_1017.json`; protect or requant if needed | 1-2 d + requant time |
 | 6 (optional) | NPU experiment: host IOMMU on (`iommu=pt`), XRT from source, measure GPU loss, prototype one ViT block (IRON or Ryzen AI ONNX BF16), go/no-go on measured s/block | 2-4+ weeks |
 
-## 9. Open questions for the user
+## 9. Open questions
 
 1. Order: CPU first, then GPU via mtmd (recommended), or straight to GPU? Is the NPU still wanted, knowing it needs
    `amd_iommu=off` removed (and a measured GPU loss of up to ~1-12%) and a hand-ported ViT?
 2. Image token cap: DeepSeek's 1024 (up to ~45 s prefill per image at the slow end), or a lower default (e.g. 576) as
    a speed knob? Is the lower cap allowed under `--speed` only?
-3. Encoder weights: BF16 straight from the checkpoint (0.97 GB; my preference) or a Q8_0 sidecar (~0.5 GB)?
+3. Encoder weights: BF16 straight from the checkpoint (0.97 GB; recommended) or a Q8_0 sidecar (~0.5 GB)?
 4. If phase 5 shows VL experts in low tiers: requantize (calibrate with image tokens) or accept?
 5. Allow http(s) image URLs (the server fetches them) or only inline/base64?
 6. Limits: max images per request, and whether old images in a long conversation keep their full spans.

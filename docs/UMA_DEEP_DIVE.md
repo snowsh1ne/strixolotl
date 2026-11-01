@@ -1,6 +1,6 @@
 # UMA deep dive: where the engine still acts like a discrete GPU (2026-10-28)
 
-**Scope.** This covers `xolotl/tools/v41/engine/` on strixhalo: gfx1151, 123.5 GiB GTT, ROCm 7.14, GSQ-217 on
+**Scope.** This covers `xolotl/tools/v41/engine/` on the test box: gfx1151, 123.5 GiB GTT, ROCm 7.14, GSQ-217 on
 the 990 Pro, quality mode. Two workloads were looked at: plain decode, and DSpark at depth 4 with
 `STRATA_DSPARK_CONF=0.6`.
 
@@ -9,8 +9,7 @@ output does not change. "Exact" means the same model math in FP32, but different
 pass. Exact changes keep DSpark's guarantee (the trunk's own greedy argmax) but can flip near-ties compared with
 today's DSpark build. Each change in the ranking is labelled one way or the other.
 
-**How it was done.** No engine source, script or doc was changed except this file. I made 6 engine runs (A-F), all
-under `flock ~/.cache/xolotl/gpu.lock`. I also sampled the other agent's runs passively (read-only sysfs, no ptrace).
+**How it was done.** No engine source, script or doc was changed except this file. Six engine runs (A-F), all under `flock ~/.cache/xolotl/gpu.lock`, plus passive samples (read-only sysfs) of concurrent prefetch runs.
 Section 6 lists the files.
 
 ## 0. Summary
@@ -26,7 +25,7 @@ Section 6 lists the files.
    | B (3 min) | 67 s |
    | D (rocprof) | 144 s |
    | E | 85 s |
-   | the other agent's pf-r2 / pf-r3 | 95 s / 87 s |
+   | concurrent runs pf-r2 / pf-r3 | 95 s / 87 s |
 
    The stalls land at the start of decode, when the 2.5-9 GiB arena extension is built. They cost 8-22 s per decode phase, with the
    GPU idle at 600 MHz. They also land in the DSpark seed passes, the drafter load and the prefill.
@@ -75,7 +74,7 @@ latency on the critical path, not bandwidth.
 | Expert arena | `src/core/pinned.cu:236-260` (4 KiB anonymous mmap: `STRATA_NO_LARGEPAGES=1` is forced by `serve/ds41-engine-strix.sh`), registered at `pinned.cu:410-425` | 80 GiB | Zero-copy (`Arena::zc`). **No mlock or pin on Linux** (the "working-set lock" is Windows-only): it can be swapped (zram) and migrated (compaction). Root of finding 1. |
 | Arena extension | `ds41_moe.cpp:2310-2340` (mmap + `cudaHostRegister` + memset, on a side thread) | 0.74-10 GiB | Same as the arena. Released before every multi-token prompt (`:5455-5464`) and rebuilt for the next decode: per-request allocate/pin churn. The build lands on the first decode pass. |
 | Dense weights | `ds41_dense.cpp:360-399` (`ggml_backend_alloc_ctx_tensors_from_buft` + `ggml_backend_tensor_set` from the GGUF mmap) | ~9 GB GTT (est.: GGUF minus experts) | A one-time pageable H2D copy. The file pages stay in the page cache (reclaimable), so nothing is held twice. |
-| DSpark drafter | `ds41_dspark.cpp:166-212`, same pattern | 7.9 GB (full), 5.1-6.5 GB (requant) | One-time pageable copy. Load took 14-87 s (A-E; 20-122 s tonight) and 150-170 s with on-load requant (CPU at 3,100 %). It takes GTT budget that the extension then can't get: 52 slots instead of 635 with the full drafter. |
+| DSpark drafter | `ds41_dspark.cpp:166-212`, same pattern | 7.9 GB (full), 5.1-6.5 GB (requant) | One-time pageable copy. Load took 14-87 s (A-E; 20-122 s on 2026-10-28) and 150-170 s with on-load requant (CPU at 3,100 %). It takes GTT budget that the extension then can't get: 52 slots instead of 635 with the full drafter. |
 | `d_stage` / `h_fstage` | `ds41_moe.cpp:1408` / `:2523, 2855, 3556` | 116 MiB device + 116 MiB pinned | Fallback only (no arena slot), so idle. |
 | `d_pf`, `h_dummy` | `ds41_moe.cpp:1421-1427` | 87 MiB | Only with `--pf-b > 0` (the server passes 0). |
 | Prompt chunk buffers (`c_stage`, `c_bounce`, `c_hparts`, graph buffer) | `ds41_moe.cpp:4085, 4149, 4215, 4255, 4726` | ~14.5 GiB beyond the arena at batch 8K | A DRAM-to-DRAM DMA of every streamed expert (78.6 GB/s). Prompt zero-copy was tried earlier and reverted: no gain, and not bit-identical. Allocated and freed around every prompt, which adds to the reclaim churn of finding 1. |
@@ -116,7 +115,7 @@ latency on the critical path, not bandwidth.
 c07's "dense 334 ms" is 99 s of seed passes spread over 404 passes; its decode passes cost the same as c06's.
 `verify ms/pass` still holds the decode-start stall (2b): up to ~22 s / 390 passes = ~57 ms/pass.
 
-**Don't compare tonight's DSpark A/Bs on these averages.** Use the per-pass `STRATA_DSPARK_CONFLOG` and drop the
+**Don't compare the 2026-10-28 DSpark A/Bs on these averages.** Use the per-pass `STRATA_DSPARK_CONFLOG` and drop the
 first decode passes, or compare `evicted_ms`.
 
 ### 2b. The stall is a KFD queue eviction
@@ -130,7 +129,7 @@ four runs):
 | B | `STRATA_D3_PF=0` | 22,065 (pass 1), 1,362 | 349 / 329 |
 | D | rocprofv3 | 9,629, 1,409, 4,291, 1,947, 1,890, 1,001, 1,098, 3,090 | 354 / 338 |
 | E | `STRATA_ARENA_EXT_GIB=0` | 1,717 | 362 / 358 |
-| pf-r1 (other agent, warm prompt, iq3 drafter) | | 22,638 (pass 1) = 38 % of its verify time | median 258 |
+| pf-r1 (concurrent run, warm prompt, iq3 drafter) | | 22,638 (pass 1) = 38 % of its verify time | median 258 |
 
 What happens during a stall:
 
@@ -151,8 +150,7 @@ What happens during a stall:
 | 111-127 | 2,434 + 14,492 + 1,188 + 747 | up to 101,788/s | | 125-150 K/s | seed passes. The engine's **VmSwap rose 0 -> 1.14 GB** |
 | 145 -> 165 | 498, then **18,952** | 102,869 | | 133,058 | extension built (MemAvailable 19.1 -> 15.8 GB), first decode pass |
 
-Over B's ~3 min, the box migrated 1.95 M pages and swapped out 7.1 M pages (27 GB) to zram. Live settings on
-strixhalo: `vm.compaction_proactiveness=20`, `vm.watermark_boost_factor=15000`,
+Over B's ~3 min, the box migrated 1.95 M pages and swapped out 7.1 M pages (27 GB) to zram. Settings on the test box (Fedora defaults): `vm.compaction_proactiveness=20`, `vm.watermark_boost_factor=15000`,
 `vm.compact_unevictable_allowed=1`, zram swap with swappiness 10, THP `madvise`.
 
 **Run E confirms the trigger.** E is A's config (without `DS41_PROF_X`) plus `STRATA_ARENA_EXT_GIB=0`. Result: no decode-start stall
@@ -185,7 +183,7 @@ Which of the two paths dominates (userptr/SVM invalidation vs TTM swap) needs `t
 | run C (agent4k, plain, under rocprof) | only 0.74 s logged in decode (10.2 s over the run). No drafter, MemAvailable 25 GiB when the 10 GiB extension was built |
 
 How large the stall gets depends on how tight memory is when the extension is built: the DSpark runs (drafter on GTT, MemAvailable 18-19 GiB) are
-hit hardest. `verify_setup` (the other agent, 23:33) decoded 32 tokens in 34.6 s. In `--serve` the extension is released before
+hit hardest. `verify_setup` (a concurrent run, 23:33) decoded 32 tokens in 34.6 s. In `--serve` the extension is released before
 every multi-token prompt and rebuilt for the decode, so every request goes through this window.
 
 ### 2c. Stall-free verify pass, by GPU time (trace D, 13 typical passes, mostly k = 4)
@@ -281,7 +279,7 @@ V = ms per DSpark verify pass (stall-free ~260-350 ms; warm prompt ~258 median).
 
 | # | Change | P | V | Effort | Bit-identity |
 |---|---|---|---|---|---|
-| R1 | **Stop the queue evictions.** (a) System profile while Xolotl runs (root, user decision; no code): `vm.compaction_proactiveness=0`, `vm.watermark_boost_factor=0`, `vm.compact_unevictable_allowed=0`, `swapoff /dev/zram0` or `vm.swappiness=0`. (b) mlock the arena and the extension: memlock is unlimited in the toolbox (patch sketch below). (c) Don't build the extension at decode start: either `STRATA_ARENA_EXT_GIB=0` (measured below), or allocate it once with the arena and keep it across prompts. (d) Alternative to (a)+(b): a hugetlb arena (`vm.nr_hugepages` ~41,000 reserved right after halogen stops; the existing `MAP_HUGETLB` path in `pinned.cu:241`): never swapped, not compacted, 2 MiB GPU PTEs. | **measured** excess 5-23 s in the first 64 steps of 4 warm benches (C: only 0.7 s logged): 1.7-7.7 ms/token over 3,000 tokens, 17-77 ms/token over 300 tokens; per request in serve | **measured** 8-22 s per decode phase (A, B, D, pf-r1, pf-r3) ~ -20 to -55 ms/pass over 390 passes. Seed / drafter-load stalls 10-99 s per run (TTFT). E (c only): decode 56.7 / 37.3 -> 17.2 s for the same 136 tokens; stall-free passes +6 ms (fewer slots) | (a) none, (b) ~10 lines, (c) env / ~30 lines, (d) root + start-script | yes (memory placement only; B and E: same 136 tokens) |
+| R1 | **Stop the queue evictions.** (a) System profile while Xolotl runs (root, optional; no code; not needed after (b)): `vm.compaction_proactiveness=0`, `vm.watermark_boost_factor=0`, `vm.compact_unevictable_allowed=0`. (b) mlock the arena and the extension: memlock is unlimited in the toolbox (patch sketch below). (c) Don't build the extension at decode start: either `STRATA_ARENA_EXT_GIB=0` (measured below), or allocate it once with the arena and keep it across prompts. (d) Alternative to (a)+(b): a hugetlb arena (`vm.nr_hugepages` ~41,000  reserved early after boot; the existing `MAP_HUGETLB` path in `pinned.cu:241`): never swapped, not compacted, 2 MiB GPU PTEs. | **measured** excess 5-23 s in the first 64 steps of 4 warm benches (C: only 0.7 s logged): 1.7-7.7 ms/token over 3,000 tokens, 17-77 ms/token over 300 tokens; per request in serve | **measured** 8-22 s per decode phase (A, B, D, pf-r1, pf-r3) ~ -20 to -55 ms/pass over 390 passes. Seed / drafter-load stalls 10-99 s per run (TTFT). E (c only): decode 56.7 / 37.3 -> 17.2 s for the same 136 tokens; stall-free passes +6 ms (fewer slots) | (a) none, (b) ~10 lines, (c) env / ~30 lines, (d) root + start-script | yes (memory placement only; B and E: same 136 tokens) |
 | R2 | **hc mixes for verify widths 4-8 through `mul_mat_vec_f`.** Engine option: in `hc_mixes` (`ds41_dense.cpp:436-441`), split the `ggml_mul_mat(fn, flat)` into column chunks of <= 3 and concat. ggml option: a `strix-NN` patch that lets F16 mmvf take ne11 <= 8 on integrated GPUs (`mmvf.cu:841`). | 0 | ~-50 per pass with m >= 4. **Measured**: 80 x 668 us = 53.4 ms of SGEMM, against ~2 ms (est.) for mmvf. ~-40 ms average at c06's 73 % full passes | small | exact. mmvf's per-column math doesn't depend on `ncols_dst`, so the mixes should match plain decode's n = 1 bits (check with `STRATA_DSPARK_DUMP` against a plain dump) |
 | R3 | **Skip `predict_multi` when the tier can't prefetch.** `pf_now &= tier.can_prefetch()` (cache open and `d_pf` allocated), or `STRATA_D3_PF=0` in the UMA wrapper today. | 0 | **measured** -3.7 (paired median, B vs A) | trivial | yes (**measured**, 136/136 tokens) |
 | R4 | **Launch each file miss's kernels as soon as its own read lands**: per-blob completion counters in `ReadPool` instead of one `wait()` (`ds41_moe.cpp:3019`, `:3793`). Overlaps the 36-63 GB/s small launches with the remaining reads. | ~-2-3 | ~-5-10 | medium | yes. Groups are independent ("results do not depend on gridDim.y"); every entry writes its own `d_parts` row |
@@ -337,7 +335,7 @@ R3, `ds41_generate.cpp:766`:
 
 ## 6. Measured vs estimated
 
-**Measured tonight.**
+**Measured 2026-10-28.**
 
 - **Runs**, logs in `~/.cache/xolotl/runs/uma/`:
 
@@ -354,10 +352,10 @@ R3, `ds41_generate.cpp:766`:
 - **Samplers**: `*.ev` (0.25 s: `evicted_ms`, MemAvailable, VmSwap, GTT, vmstat), `*.gpu` (0.1 s: busy %, sclk,
   power, CPU MHz), `A.stacks` (eu-stack), `*.conf` (per-pass verify ms), `trace-{C,D,F}/` (rocprofv3 CSV).
   Analysis scripts are in `py/`.
-- **Read-only samples of the other agent's runs** pf-r1/r2/r3: `other-pf-r1.gpu`, `other2.ev/.gpu`. Their conf logs
+- **Read-only samples of concurrent runs** pf-r1/r2/r3: `other-pf-r1.gpu`, `other2.ev/.gpu`. Their conf logs
   are in `runs/prefetch/`.
 - **Numbers**:
-  - eviction totals and timelines, the stall passes, the seed-time decomposition (from tonight's logs);
+  - eviction totals and timelines, the stall passes, the seed-time decomposition (from the 2026-10-28 logs);
   - the SGEMM cost per pass and its width dependence;
   - the expert kernel durations / rates;
   - the gap classes in trace D;

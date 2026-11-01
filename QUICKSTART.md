@@ -14,18 +14,18 @@ Two ways to get the model:
 When you're done, `scripts/verify_setup` checks the whole setup (section 8).
 
 Ground rules:
-- The repo can live on NFS. Builds, clones, temp files and models must be on the local NVMe (`~/.cache/xolotl`,
-  `~/models/xolotl`), never on the share.
+- Builds, the llama.cpp clone, temp files and models go on a local NVMe (`~/.cache/xolotl`, `~/models/xolotl`), not on
+  a network filesystem.
 - Run the host check first (below: a gfx1151 KFD node listed, GTT ~100+ GiB). Build and run only on the Strix Halo.
 
-Paths below: `REPO=~/projects/Xolotl_StrixHalo` (wherever the share is mounted), `M=~/models/xolotl`,
+Paths below: `REPO=<your clone of strixolotl>`, `M=~/models/xolotl`,
 `G=$M/V41-1017-GSQ`.
 
 ---
 
 ## 1. Host prerequisites (once, outside any container)
 
-| Item | Value on strixhalo (2026-10) |
+| Item | Tested values (2026-10) |
 |---|---|
 | Box | Ryzen AI MAX+ 395 / Radeon 8060S (gfx1151, 40 CUs), 128 GB unified memory |
 | OS | Fedora 43, kernel 7.1.10-100.fc43 (6.18.5+ or 7.x works) |
@@ -35,7 +35,7 @@ Paths below: `REPO=~/projects/Xolotl_StrixHalo` (wherever the share is mounted),
 | memlock | unlimited: `/etc/security/limits.d/99-memlock-unlimited.conf` with `* soft memlock unlimited` and `* hard memlock unlimited`, then log in again. The engine pins an ~80-87 GiB arena. |
 | GPU access | `/dev/kfd` and `/dev/dri` read/write for your user (`render` and `video` groups, or the seat ACL) |
 | Disk, path A | ~460 GB free on a local NVMe: GGUF 243.1 GB + Engram shards 203.1 GB + one 10.7 GB part while downloading, images ~9 GB |
-| Disk, path B | ~1 TB: HF checkpoint 510 GB (476 GiB), GGUF 243.1 GB, calibration work dir ~47 GiB (calib-1017-v2: 40 GB after the run), images ~24 GB. strixhalo started with 1161 GB free on `/home` (btrfs, `compress=zstd:1`). |
+| Disk, path B | ~1 TB: HF checkpoint 510 GB (476 GiB), GGUF 243.1 GB, calibration work dir ~47 GiB (calib-1017-v2: 40 GB after the run), images ~24 GB. |
 | NVMe speed | Decode is bound by expert reads from the drive: see [SSD_SPEED.md](SSD_SPEED.md) before buying or choosing a drive |
 
 ```bash
@@ -48,17 +48,16 @@ ulimit -l          # unlimited
 ```
 
 Notes:
-- `amdgpu.gttsize=126976 ttm.pages_limit=32505856` (~124 GiB, the strixite guides' values) also works; the box runs
-  the values in the table above.
+- `amdgpu.gttsize=126976 ttm.pages_limit=32505856` (~124 GiB, the strixite guides' values) also works; the table's
+  values are the tested ones.
 - Don't set `HSA_OVERRIDE_GFX_VERSION`: the build is native gfx1151. `common.sh` unsets it.
 - On btrfs, the model directories must be `chattr +m` (no compression), because btrfs serves O_DIRECT reads of
   compressed extents as buffered reads. `scripts/download_model` sets it itself (path A). For path B run `chattr +m`
   on the host before the GGUF is written (step 5.4); the toolbox has no `chattr` binary. Models on exFAT, NFS or SMB
   are refused.
-- ROCm RPM layer cache: `toolbox/Containerfile`'s first two `RUN` layers are byte-identical to
-  `~/src/toolbox-qwen4exp-opt/Dockerfile.rocm-7.14`. On strixhalo podman therefore reuses the cached 8.4 GB
-  `amdrocm-core-devel7.14-gfx1151` layer, and the image builds in ~30 s. On a fresh box that layer downloads from
-  `repo.amd.com`. Don't reformat those two layers.
+- ROCm RPM layer: the first image build downloads the ~8.4 GB `amdrocm-core-devel7.14-gfx1151` layer from
+  `repo.amd.com`; later rebuilds reuse podman's cached layer (~30 s). Don't reformat `toolbox/Containerfile`'s first
+  two `RUN` layers, or the cache is lost.
 
 ## 2. Toolboxes
 
@@ -81,8 +80,8 @@ from the host.
 | `xolotl-quant` (15.3 GB) | `toolbox/Containerfile.quant`: the image above + **torch 2.11.0+rocm7.13.0** from `https://repo.amd.com/rocm/whl/gfx1151/`. torch loads its own ROCm 7.13 pip libraries, not `/opt/rocm/core`. It also gets `requirements-quant.txt`, which is not pinned. Installed today: safetensors 0.8.0, tokenizers 0.23.3, transformers 5.20.1, datasets 5.1.0, pyarrow 26.0.0. |
 
 Reproducibility note: the Containerfiles are the declarative spec. Three things in them float: the ROCm package
-(any 7.14.x), `requirements-quant.txt`, and `huggingface_hub`. Pinning ROCm to `-7.14.1` would stop the layer
-sharing with the other toolboxes. For a bit-exact rebuild, pin the versions listed above.
+(any 7.14.x), `requirements-quant.txt`, and `huggingface_hub`. Pinning ROCm to `-7.14.1` would stop sharing that layer
+with other ROCm 7.14 images. For a bit-exact rebuild, pin the versions listed above.
 
 ## 3. Build the engine (in `xolotl-strix`)
 
@@ -166,7 +165,7 @@ sets:
 
 Long steps: start them detached so they survive a logout, e.g.
 `setsid nohup toolbox run -c xolotl-quant bash -c '. scripts/v41_1017.env && ...' > log 2>&1 < /dev/null &`.
-The whole GSQ-217 chain (calibration -> quant pass) is in `$M/v41-work/calib-1017-v2/run_chain.sh`.
+The GSQ-217 chain is sections 5.1-5.9 in order (corpus, calibration, then the quant pass).
 
 > GPTQ is **not bit-reproducible** from run to run: the expert token counts differ by layer 0, and nearly every
 > code differs from layer 1 on. A redo gives a different (equivalent) GGUF. Always record which run produced a GGUF.
@@ -186,7 +185,7 @@ mkdir -p $R/wikipedia-zh && curl -sSfL -o $R/wikipedia-zh/train-00002-of-00006.p
 # pile-10k into the HF datasets cache (prep reads it offline afterwards)
 HF_DATASETS_OFFLINE=0 python3 -c 'import datasets; datasets.load_dataset("NeelNanda/pile-10k", split="train")'
 # agentic coding sessions (Claude Code-format JSONL logs) for the agentic pools: list the folders that hold them
-export V41_SESSION_ROOTS=~/.claude/projects   # ":"-separated; add more folders as needed
+export V41_SESSION_ROOTS=<folders with Claude Code-format JSONL sessions>   # e.g. ~/.claude/projects; ":"-separated
 ```
 
 `V41_GGUF_PY` points at `~/.cache/xolotl/llama.cpp/gguf-py`, so build the engine (step 3) first.
@@ -197,7 +196,7 @@ export V41_SESSION_ROOTS=~/.claude/projects   # ":"-separated; add more folders 
 cd ~ && python3 $REPO/xolotl/tools/v41/build_corpus.py \
   --zh-parquet ~/.cache/xolotl/calib-refs/wikipedia-zh/train-00002-of-00006.parquet \
   --windows 4 --spread --tool-chars 2000 --tool-arg-chars 4000 --sessions 400 \
-  --select $V41_WORK/corpus-select.json --exclude-session <live session id>
+  --select $V41_WORK/corpus-select.json   # optional: --exclude-session <id> skips a session still being written
 cd $REPO
 ```
 
@@ -313,19 +312,18 @@ XOLOTL_DSV41_GGUF="$HOME/models/xolotl/V41-1017-GSQ/V41-1017-GSQ-217.gguf"
 XOLOTL_DSV41_RANK="$HOME/models/xolotl/V41-1017-GSQ/rank-217.bin"
 XOLOTL_DSV41_TOKENIZER="$HOME/models/xolotl/V41-1017-GSQ/tokenizer"
 XOLOTL_DSV41_ENGRAM="$HOME/models/xolotl/DeepSeek-V4.1-Flash-1017"
-XOLOTL_DSV41_DSPARK="/mnt/fast/V41-1017-MTP/V41-1017-MTP.IQ3_XXS.gguf"   # only for --dspark
+XOLOTL_DSV41_DSPARK="$HOME/models/xolotl/V41-1017-MTP/V41-1017-MTP.IQ3_XXS.gguf"   # for DSpark (the default)
 ```
 `--dspark` needs the MTP sidecar. Path A: `download_model` fetches `dspark/V41-1017-MTP.IQ3_XXS.gguf` and writes this
 line. Path B: build it from shards 44-46 of the checkpoint (CPU only, a few minutes):
 ```bash
 toolbox run -c xolotl-quant env V41_SRC=$M/DeepSeek-V4.1-Flash-1017 V41_GGUF_PY=$HOME/.cache/xolotl/llama.cpp/gguf-py \
-  python3 xolotl/tools/v41/v41_sidecar.py --out /mnt/fast/V41-1017-MTP/V41-1017-MTP.gguf --no-vision   # 7.9 GB, MXFP4 experts
+  python3 xolotl/tools/v41/v41_sidecar.py --out $M/V41-1017-MTP/V41-1017-MTP.gguf --no-vision   # 7.9 GB, MXFP4 experts
 toolbox run -c xolotl-strix ~/.cache/xolotl/build-strix/v41_sidecar_requant \
-  --in /mnt/fast/V41-1017-MTP/V41-1017-MTP.gguf --out /mnt/fast/V41-1017-MTP/V41-1017-MTP.IQ3_XXS.gguf --type iq3_xxs   # 5.9 GB
+  --in $M/V41-1017-MTP/V41-1017-MTP.gguf --out $M/V41-1017-MTP/V41-1017-MTP.IQ3_XXS.gguf --type iq3_xxs   # 5.9 GB
 ```
 
-Copies of the live paths files are in `scripts/paths/` (`V41-1017.paths` = GSQ-217, the served model;
-`V41-1017-200.paths` = GSQ-200). The start script reads `~/models/xolotl/V41-1017.paths`, not the repo copy.
+The start script reads `~/models/xolotl/V41-1017.paths`.
 
 ## 6. Run the server (in `xolotl-strix`)
 
@@ -378,10 +376,8 @@ Check the startup log:
 - `arena: zero-copy` appears.
 - The arena is ~86.7 GiB (~6,680 experts).
 
-**pi agent provider:** the `xolotl-ds41` entry in `~/projects/models.json` (copy that entry rather than
-retyping it). It sets:
-- Connection: `api: "openai-completions"`, `baseUrl` = the server's `/v1` (`http://strixhalo:8150/v1` on the LAN;
-  the file has the Tailscale IP), `apiKey: "none"`.
+**Client example** (the pi agent; any OpenAI-compatible client works the same way):
+- Connection: `api: "openai-completions"`, `baseUrl: "http://<host>:8150/v1"`, `apiKey: "none"`.
 - Model: id `strixolotl-v4.1-flash`, `reasoning: true`.
 - Limits: `contextWindow: 212000` and `maxTokens: 49152` (fit the `--no-long` 262144 ctx; the default 1048576 ctx allows
   a larger `contextWindow`).
@@ -462,16 +458,16 @@ Run it on the host, not in a toolbox. It tells the two layouts apart by the path
     headroom.
 - **A killed engine frees its pinned ~80-90 GiB arena over several seconds.** Wait for MemAvailable >= 110 GiB
   before starting the next run (`verify_setup` and `scripts/dev/gen.sh` do this). Two engines at once will OOM the box.
-- **Another model server** (halogen etc.) shows up as low MemAvailable (< ~115 GiB idle). Stop it before starting
+- **Another GPU- or memory-heavy process** shows up as low MemAvailable (< ~115 GiB idle). Stop it before starting
   anything big.
 - **Span (`--prefill-chunk`, default 512 = min with the prompt batch) above 512 needs much more memory:** 4096 makes
   an 18 GB graph and OOMs. Keep S = 512.
 - **Single-text ppl is noise.** DeepSeek-V4.1's late-context predictions are hypersensitive (top-512 over FP4 indexer
   q/k). Any perturbation moves one 4K text's ppl by several percent. Compare top-1 agreement with the teacher over
   many sequences, teacher KL, or task outcomes, never one text.
-- **The drive sets decode speed.** ~13 expert misses per token at 7.4-8.4 ms each on the measured drive, which
-  spends 14-34% of decode in ~18 s slow phases under sustained reads. [SSD_SPEED.md](SSD_SPEED.md) has the estimates and a `fio` test.
-- **NFS vs local disk.** The share is 100 Mbit on HDDs:
+- **The drive sets decode speed.** ~13 expert misses per token at ~2.5 ms each on a Samsung 990 Pro; slower drives
+  cost more. [SSD_SPEED.md](SSD_SPEED.md) has the estimates and a `fio` test.
+- **Local disk only:**
   - Builds, the llama.cpp clone, `__pycache__` (`PYTHONPYCACHEPREFIX`), the work dirs and models all go on the local
     NVMe.
   - `common.sh` refuses NFS/exFAT/SMB for models.
