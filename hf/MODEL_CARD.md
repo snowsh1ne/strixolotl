@@ -145,6 +145,10 @@ V41-1017-GSQ-217.gguf`, then `sha256sum -c SHA256SUMS` in a folder that holds th
 - The server's greedy decode is not repeatable across requests (the expert arena changes between requests); one-shot
   engine runs at a fixed arena are.
 
+## Support
+
+If this model is useful to you: [buymeacoffee.com/snowsh1ne](https://buymeacoffee.com/snowsh1ne).
+
 ## License
 
 The weights are derived from DeepSeek-V4.1-Flash-1017, which DeepSeek releases under the MIT License
