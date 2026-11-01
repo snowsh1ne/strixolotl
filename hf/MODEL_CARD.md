@@ -25,7 +25,8 @@ A quantization of [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/
 **Strixolotl** (Xolotl on Strix Halo): a HIP/ROCm port of the [Xolotl](https://github.com/Indras-Mirror/Xolotl)
 engine that runs the whole model on one AMD Ryzen AI Max (Strix Halo, gfx1151) box with 128 GB of unified memory.
 
-Strixolotl repo: <https://github.com/snowsh1ne/strixolotl>.
+Strixolotl repo: <https://github.com/snowsh1ne/strixolotl> (release
+[0.1.0](https://github.com/snowsh1ne/strixolotl/releases/tag/0.1.0)).
 
 This file is **not** a llama.cpp, Ollama or LM Studio GGUF. Its experts use per-expert quantization types those
 runtimes do not load. Use it with Strixolotl.

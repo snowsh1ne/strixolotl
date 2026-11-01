@@ -5,10 +5,11 @@ it is not published. Numbers come from one box: Minisforum MS-S1 MAX (Ryzen AI M
 128 GB), Fedora 43, ROCm 7.14.1, model on a Samsung 990 Pro 1 TB NVMe. Measured and estimated numbers are kept apart;
 "measured" means a run on that box.
 
-## Where it stands (2026-10-31)
+## Where it stands (2026-11-01)
 
-The port, the quantization and the performance work are done and frozen. This repository is the public release;
-the Hugging Face repo opens with it.
+The port, the quantization and the performance work are done and frozen. Released as
+[0.1.0](https://github.com/snowsh1ne/strixolotl/releases/tag/0.1.0) on 2026-11-01, together with the public Hugging Face
+repo.
 
 | | DSpark (default) | plain decode (`--no-dspark`) |
 |---|---|---|
@@ -53,7 +54,8 @@ it (DSpark).
 | 2026-10-27 | Samsung 990 Pro: decode +43%, prefill ~2x, losslessly; DSpark (MTP drafts) measured |
 | 2026-10-28 | UMA polish (mlocked arena, fewer queue evictions); DSpark serve config; cancel-and-resume for DSpark; release prepared and uploaded to Hugging Face (private) |
 | 2026-10-29/30 | Prefill work: fused attention-key gather, predicted reads, MMQ fault fix and `--fast-prefill`; performance frozen |
-| 2026-10-31 | DSpark, long context and LAN serving become the start-script defaults; GitHub release prepared |
+| 2026-10-31 | DSpark, long context and LAN serving become the start-script defaults |
+| 2026-11-01 | Public release 0.1.0 (GitHub) and the public Hugging Face repo |
 
 ## Quality A/B (17 held-out rows)
 
@@ -177,7 +179,7 @@ Every change in `xolotl/` is marked `strix-port:` in the code. The main ones:
 ## Roadmap
 
 **Next**
-1. Hugging Face repo public, after a test download from a clean folder.
+- Nothing scheduled. Bug reports and measurements from other boxes and drives are welcome (issues).
 
 **Parked (not planned; measured or estimated where noted)**
 - Prefill: prediction buffer inside the decode arena extension (would remove its decode cost); a faster on-demand
