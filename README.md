@@ -128,6 +128,10 @@ DSpark; `--local` or `--api-key KEY` to restrict it, `--fast-prefill` for the fa
   - [OpenBMB/llama.cpp-omni](https://github.com/OpenBMB/llama.cpp-omni) (its MoE expert-slot predictor, reviewed for
     the read path).
 
+## Support
+
+If Strixolotl is useful to you: [buymeacoffee.com/snowsh1ne](https://buymeacoffee.com/snowsh1ne).
+
 ## License
 
 - The Strixolotl code (scripts, docs, the port's changes): MIT, see [LICENSE](LICENSE).
