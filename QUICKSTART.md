@@ -6,7 +6,7 @@ of experts, run `quant-1017-217`) in quality mode. Measurements, milestones and 
 [ROADMAP.md](ROADMAP.md); the overview is [README.md](README.md). This file only gives the recipe.
 
 Two ways to get the model:
-- **Path A (recommended): download the prequantized GSQ-217** from Hugging Face (section 4.1). ~447 GB download, no
+- **Path A (recommended): download the prequantized GSQ-217** from Hugging Face (section 4.1). ~452 GB download (incl. the DSpark sidecar), no
   quantization, no full DeepSeek checkpoint, only the `xolotl-strix` toolbox.
 - **Path B: quantize it yourself** (sections 4.2 and 5). ~510 GB checkpoint download, ~22 h of calibration and
   quantization, both toolboxes. GPTQ is not bit-reproducible, so you get an equivalent file, not this one.

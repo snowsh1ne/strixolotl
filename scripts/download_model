@@ -16,7 +16,7 @@
 #      DeepSeek checkpoint (or the two shards + index) in DIR; nothing is downloaded for Engram.
 #   4. $XOLOTL_MODELS/V41-1017.paths (an existing one is kept as V41-1017.paths.bak-<time>)
 #
-# Disk: ~447 GB downloaded, ~457 GB free needed at the peak (the GGUF + one 10.7 GB part + Engram).  On btrfs the two
+# Disk: ~452 GB downloaded, ~464 GB free needed at the peak (the GGUF + one 10.7 GB part + the DSpark sidecar + Engram).  On btrfs the two
 # model folders get chattr +m (no compression) before anything is written: compressed extents break the engine's
 # O_DIRECT expert reads.  Models on NFS, SMB or exFAT are refused.
 . "$(dirname "$0")/lib/common.sh"

@@ -542,10 +542,14 @@ def cmd_fetch(a):
         have = sum(p["size"] for p in g["parts"][:st["done"]])
         gg_need = g["size"] - have
     big_part = max(p["size"] for p in g["parts"])
-    need = gg_need + (big_part if gg_need else 0) + eng_need + (1 << 30)
+    # the small files and the DSpark sidecar (5.9 GB) land next to the GGUF: count what is not there yet
+    files_need = sum(f["size"] for f in man["files"] if not f["path"].startswith("engram/")
+                     and not (os.path.exists(os.path.join(gsq, f["path"]))
+                              and os.path.getsize(os.path.join(gsq, f["path"])) == f["size"]))
+    need = gg_need + (big_part if gg_need else 0) + files_need + eng_need + (1 << 30)
     log(f"{man['name']}: GGUF {gb(g['size'])} in {len(g['parts'])} parts, Engram {gb(sum(s['size'] for s in e['shards']))} "
         f"({'from ' + eng_dir if a.engram_dir else ('mirror in ' + a.repo if a.engram_from == 'mirror' else e['repo'] + '@' + e['revision'][:12])})")
-    log(f"to download: {gb(gg_need + eng_need)}; disk needed now: {gb(need)}; free in {models}: {gb(free_bytes(models))}")
+    log(f"to download: {gb(gg_need + files_need + eng_need)}; disk needed now: {gb(need)}; free in {models}: {gb(free_bytes(models))}")
     if a.dry_run:
         log(f"dry run: GGUF -> {out}, Engram -> {eng_dir}, paths -> {os.path.join(models, a.paths_name)}")
         return
