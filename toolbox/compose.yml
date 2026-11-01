@@ -1,0 +1,44 @@
+# Xolotl DeepSeek-V4.1 server as a container (podman-compose or docker compose), for running it without entering
+# the toolbox.  Same image as the toolbox (toolbox/Containerfile).  Run through the wrapper, which fills in the paths:
+#
+#   scripts/xolotl_compose up        # builds the image if needed, then serves on 127.0.0.1:8150 (logs in the foreground)
+#   scripts/xolotl_compose down
+#
+# The repo, the models and the build cache are mounted at the SAME paths as on the host, so the build folder, the
+# generated config and the models' .paths file mean the same thing inside and outside (the toolbox does this too:
+# it shares $HOME).  Build the engine first (in the toolbox: scripts/build_xolotl, or scripts/xolotl_compose build-engine).
+name: xolotl
+services:
+  dsv41:
+    image: ${XOLOTL_IMAGE:-localhost/xolotl-strix:rocm7.14}
+    build:
+      context: .
+      dockerfile: Containerfile
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - keep-groups            # podman (crun); with docker use the numeric gids of video and render instead
+    security_opt:
+      - seccomp=unconfined     # ROCm's runtime in a rootless container
+      - label=disable          # no SELinux relabeling (as toolbox): the repo may be an NFS mount, which :z cannot relabel
+    ipc: host
+    network_mode: host         # the server binds 127.0.0.1:${XOLOTL_PORT}; host networking keeps that local-only
+    ulimits:
+      memlock: -1              # the engine pins its expert arena
+    userns_mode: keep-id       # podman: files in the mounts stay yours
+    environment:
+      HOME: ${HOME}
+      XOLOTL_MODELS: ${XOLOTL_MODELS}
+      XOLOTL_CACHE: ${XOLOTL_CACHE}
+      XOLOTL_STATE: ${XOLOTL_STATE}
+      HSA_DISABLE_COREDUMP_ON_EXCEPTION: "1"
+    volumes:
+      - ${XOLOTL_REPO}:${XOLOTL_REPO}
+      - ${XOLOTL_MODELS}:${XOLOTL_MODELS}
+      - ${XOLOTL_CACHE}:${XOLOTL_CACHE}
+      - ${XOLOTL_STATE}:${XOLOTL_STATE}
+    working_dir: ${XOLOTL_REPO}
+    command: ["${XOLOTL_REPO}/scripts/start_xolotl_dsv41", "--port", "${XOLOTL_PORT}"]
+    stop_signal: SIGINT
+    stop_grace_period: 60s

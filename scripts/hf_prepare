@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# scripts/hf_prepare - build the Hugging Face upload folder for the Strixolotl quant (GSQ-217): the model card, LICENSE,
+# manifest.json, SHA256SUMS, rank.bin, .experts.json, tokenizer/, the Engram index, and the GGUF as byte-range parts.
+# Uploads nothing (scripts/hf_upload does that).  Run on strixhalo while no long test needs the NVMe: the first run
+# reads the whole 243 GB GGUF once to hash it (~2-4 min at the drive's sequential rate); later runs reuse the hashes.
+#
+#   scripts/hf_prepare [--out DIR] [--budget 217] [--part-gib 10] [--mode auto|reflink|copy] [--with-engram] [--dry-run]
+#
+#   --out DIR       the upload folder (default $XOLOTL_CACHE/hf-release/V41-1017-GSQ-<budget>); not inside the GGUF dir
+#   --part-gib N    part size (default 10 GiB -> 23 parts; Hugging Face recommends files < 200 GB, hard limit 500 GB)
+#   --mode auto     btrfs: the parts are reflinks of the GGUF (FICLONERANGE): no extra space, no copy.  Elsewhere the
+#                   parts are cut one at a time by scripts/hf_upload, uploaded and deleted (needs one part of space).
+#   --with-engram   also mirror DeepSeek's two Engram shards (2 x 101.5 GB, reflinked) into engram/.  Default: not
+#                   mirrored; scripts/download_model fetches them from deepseek-ai/DeepSeek-V4.1-Flash-1017 (pinned).
+#   --dry-run       print the plan; hash and write nothing
+#
+# Sources (from ~/models/xolotl/V41-1017.paths and the checkpoint dir): the GGUF, rank-<budget>.bin, the GGUF's
+# .experts.json, tokenizer/, DeepSeek's model.safetensors.index.json + config.json + LICENSE; the card is hf/MODEL_CARD.md.
+. "$(dirname "$0")/lib/common.sh"
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-$HOME/.cache/xolotl/pycache}"
+
+BUDGET=217
+OUT=""
+ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --out) OUT="$2"; shift ;;
+        --budget) BUDGET="$2"; shift ;;
+        --part-gib) ARGS+=(--part-gib "$2"); shift ;;
+        --mode) ARGS+=(--mode "$2"); shift ;;
+        --with-engram) ARGS+=(--with-engram) ;;
+        --dry-run) ARGS+=(--dry-run) ;;
+        -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
+
+GSQ="$XOLOTL_MODELS/V41-1017-GSQ"
+SRC="$XOLOTL_MODELS/DeepSeek-V4.1-Flash-1017"
+GGUF="$GSQ/V41-1017-GSQ-$BUDGET.gguf"
+OUT="${OUT:-$XOLOTL_CACHE/hf-release/V41-1017-GSQ-$BUDGET}"
+CARD="$XOLOTL_REPO/hf/MODEL_CARD.md"
+for f in "$GGUF" "$GGUF.experts.json" "$GSQ/rank-$BUDGET.bin" "$SRC/model.safetensors.index.json" "$SRC/LICENSE" "$CARD"; do
+    [ -s "$f" ] || die "missing $f"
+done
+[ -d "$GSQ/tokenizer" ] || die "missing $GSQ/tokenizer"
+grep -q 'TODO' "$CARD" && warn "$CARD still has TODOs (grep -n TODO $CARD): fill them before the upload"
+xolotl_check_fs "$(dirname "$OUT")"
+
+# the DSpark sidecar of the paths file (start_xolotl_dsv41 --dspark), if there is one
+DSP="$( . "$XOLOTL_MODELS/V41-1017.paths" 2>/dev/null; echo "${XOLOTL_DSV41_DSPARK:-}" )"
+[ -s "$DSP" ] && ARGS+=(--dspark-sidecar "$DSP")
+exec "$(xolotl_python)" -I "$XOLOTL_REPO/scripts/lib/hf_release.py" prepare \
+    --gguf "$GGUF" --rank "$GSQ/rank-$BUDGET.bin" --experts-json "$GGUF.experts.json" --tokenizer "$GSQ/tokenizer" \
+    --engram-src "$SRC" --card "$CARD" --license "$SRC/LICENSE" --out "$OUT" \
+    --quant-desc "GSQ-$BUDGET: GPTQ-calibrated per-expert tiers (PTQ1_0 / Q2_0 / Q3_K), $BUDGET GiB of experts, dense half Q8_0; calibration calib-1017-v2, quant run quant-1017-$BUDGET" \
+    "${ARGS[@]}"

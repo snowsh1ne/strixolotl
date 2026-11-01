@@ -1,0 +1,166 @@
+diff -ruN a/xolotl/tools/v41/engine/ds41_dense.cpp b/xolotl/tools/v41/engine/ds41_dense.cpp
+--- a/xolotl/tools/v41/engine/ds41_dense.cpp	2026-10-28 07:17:06.153282971 +0100
++++ b/xolotl/tools/v41/engine/ds41_dense.cpp	2026-10-28 07:17:20.812258014 +0100
+@@ -1815,6 +1815,8 @@
+ 
+ int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
+ 
++int Ds41Dense::window_slack() const { return (int) (p_->RAW - p_->SWA); }
++
+ bool Ds41Dense::park(int64_t positions) {
+     Impl & im = *p_;
+     if (im.snap_pos < 0 || positions < 1) return false;
+diff -ruN a/xolotl/tools/v41/engine/ds41_dense.hpp b/xolotl/tools/v41/engine/ds41_dense.hpp
+--- a/xolotl/tools/v41/engine/ds41_dense.hpp	2026-10-28 07:17:06.143189764 +0100
++++ b/xolotl/tools/v41/engine/ds41_dense.hpp	2026-10-28 07:17:16.704265545 +0100
+@@ -149,6 +149,12 @@
+     bool snapshot(int pos);
+     bool restore();
+     int snapshot_pos() const;
++    /// The window ring's slack (RAW - SWA = 16): a pass that starts at position s reads the window rows [s - SWA + 1,
++    /// s - 1] from the ring by slot pos % RAW, so it is valid as long as no position > s + slack was written since
++    /// those rows were (a write at q evicts q - RAW).  Rewinding the live caches (no restore()) to s is safe iff every
++    /// position written past s is <= s + window_slack() and - for an odd s - position s - 1's ratio-2 compressor state
++    /// is still in the 2-slot state ring (the caller re-feeds s - 1 otherwise).  CANCEL_REUSE.md.
++    int window_slack() const;
+     /// Serve: keep a conversation through an UNRELATED request.  An unrelated request writes its own positions from 0, so
+     /// it overwrites the start of every position-indexed cache (compressed KV, indexer keys) and the snapshot rings.
+     /// park(n) copies the snapshot rings + the first n positions' rows of those caches (and their spare rows) to host
+diff -ruN a/xolotl/tools/v41/engine/ds41_dspark.cpp b/xolotl/tools/v41/engine/ds41_dspark.cpp
+--- a/xolotl/tools/v41/engine/ds41_dspark.cpp	2026-10-28 07:17:06.173228733 +0100
++++ b/xolotl/tools/v41/engine/ds41_dspark.cpp	2026-10-28 07:17:30.689239906 +0100
+@@ -270,6 +270,10 @@
+     p_->filled.assign(WIN, -1);
+ }
+ 
++void Ds41DSpark::truncate(int pos) {
++    for (int & q : p_->filled) if (q >= pos) q = -1;
++}
++
+ static ggml_tensor * fake_quant_fp8(ggml_context * c, ggml_tensor * x) {
+ #if defined(STRATA_DSV41_FQ_OP)
+     static const bool composite = std::getenv("STRATA_FQ_COMPOSITE") != nullptr;
+diff -ruN a/xolotl/tools/v41/engine/ds41_dspark.hpp b/xolotl/tools/v41/engine/ds41_dspark.hpp
+--- a/xolotl/tools/v41/engine/ds41_dspark.hpp	2026-10-28 07:17:06.162284546 +0100
++++ b/xolotl/tools/v41/engine/ds41_dspark.hpp	2026-10-28 07:17:25.728249001 +0100
+@@ -48,6 +48,10 @@
+     bool step(const float * main_hidden, const int * pos, int k, int bonus, int * ids, float * conf);
+     /// Forget the window (a new conversation / a rewind past it).
+     void reset();
++    /// Forget the window's positions >= pos (a rewind to pos; the rows below it stay - they are main_hidden rows of
++    /// positions whose tokens did not change).  The window is position-keyed (slot pos % 128, `filled` = the position a
++    /// slot holds, visible iff in (p - 128, p]), so this is exact; the next step() appends from pos on.
++    void truncate(int pos);
+     double last_ms() const;             ///< wall time of the last step's graph
+     size_t weight_bytes() const;        ///< device bytes of the stack's weights
+     const std::string & last_error() const;
+diff -ruN a/xolotl/tools/v41/engine/ds41_generate.cpp b/xolotl/tools/v41/engine/ds41_generate.cpp
+--- a/xolotl/tools/v41/engine/ds41_generate.cpp	2026-10-28 07:17:06.133405807 +0100
++++ b/xolotl/tools/v41/engine/ds41_generate.cpp	2026-10-28 07:23:31.387238931 +0100
+@@ -1258,6 +1258,19 @@
+         int dsp_next = -1;
+         const int sp_depth_serve = std::getenv("STRATA_DSPARK_DEPTH") ? std::max(1, std::min(5, std::atoi(std::getenv("STRATA_DSPARK_DEPTH")))) : 4;
+         long sv_pass = 0, sv_acc = 0;
++        // STRATA_SERVE_DSPARK_RESUME (default on; =0 the old rules): where a request continues a DSpark-decoded history.
++        // A verify pass emits up to 1 + k tokens at once, so when the front end cancels (reasoning budget, stop string,
++        // a client that left) after token N the engine has already emitted - and put into hist - up to k more, which the
++        // front end dropped: the continuation then matched hist only to lcp < hist.size() and fell back to the snapshot
++        // at the prompt's end (2026-10-28: 367 tokens re-read, ~13 s, where plain decode fed 17).  The live caches are a
++        // rejected-draft situation: every position < lcp holds the right token's rows and the positions written past lcp
++        // are stale.  So resume at s = lcp (min(lcp, prompt - 1)) - re-feeding s - 1 first when s is odd and a pass wrote
++        // >= s (the ratio-2 compressor's 2-slot state ring, the DSpark loop's own `refeed` rule) - iff every position
++        // written is <= s + window_slack() (the window ring; Ds41Dense::window_slack).  dsp_whi = the highest position
++        // any pass of the last request wrote (-1: that request did not decode with DSpark - plain keeps its own rules).
++        // This also covers a continuation at lcp == hist.size() after a rejection, which re-fed nothing so far.
++        static const bool dsp_resume_on = !(std::getenv("STRATA_SERVE_DSPARK_RESUME") && std::getenv("STRATA_SERVE_DSPARK_RESUME")[0] == '0');
++        int dsp_whi = -1;
+ #endif
+         // STRATA_SERVE_STEP_MAX: new prompt tokens up to which a request runs on the decode side - passes of
+         // STRATA_SERVE_PASS_M tokens with the VRAM cache and the decode biases (~40 tok/s) - instead of the exact
+@@ -1354,8 +1367,29 @@
+             }
+             int reused = 0;
+             bool regen = false;   // the snapshot's own prompt again: nothing new to feed
++            bool dsp_hist = false;   // DSpark mode: the live caches' history follows the resume rule (STRATA_SERVE_DSPARK_RESUME)
++            int dsp_resume = -1;     // ... and is resumed here without a restore (-1: the snapshot / a new conversation)
++            int whi_base = -1;       // a resume on the live caches: the highest stale position they still hold (carried)
++#if defined(DS41_HAVE_DSPARK)
++            dsp_hist = dsp_resume_on && dsp_path && dsp_whi >= 0 && reuse_override < 0 && !unparked && !hist.empty();
++            if (dsp_hist && lcp >= 1 && (lcp == hist.size() || snap_len < 0 || lcp > (size_t) snap_len)) {
++                int s = (int) std::min(lcp, ids.size() - 1);   // >= 1 token to feed (its logits start the decode)
++                if ((s & 1) && dsp_whi >= s) --s;   // s - 1's ratio-2 state left the ring: re-feed s - 1 (the same token)
++                if (s >= 1 && s >= snap_len && dsp_whi - s <= dense.window_slack()) dsp_resume = s;
++            }
++#endif
+             if (reuse_override >= 0) reused = reuse_override;   // a partial unpark: positions [0, lp) are the parked one's
+-            else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
++#if defined(DS41_HAVE_DSPARK)
++            else if (dsp_resume >= 0) {   // the live caches, rewound to dsp_resume (positions >= it are re-fed / stale)
++                if (lcp != hist.size() || dsp_resume != (int) lcp)
++                    std::fprintf(stderr, "serve: DSpark resume at %d (lcp %zu of hist %zu, passes wrote up to %d)\n", dsp_resume,
++                                 lcp, hist.size(), dsp_whi);
++                hist.resize((size_t) dsp_resume);
++                reused = dsp_resume;
++                whi_base = dsp_whi;
++            }
++#endif
++            else if (!dsp_hist && !unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
+             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && !snap_logits.empty() && dense.restore()) {
+                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
+                 reused = snap_len;
+@@ -1389,8 +1423,13 @@
+             int sp_tail = 0;   // DSpark: the last new prompt tokens, fed by pass_v (seeds the window)
+ #if defined(DS41_HAVE_DSPARK)
+             if (dsp_path) {
+-                if (!(reused > 0 && reused == dsp_next) && dsp) dsp->reset();
++                // a resume below dsp_next keeps the window's rows below the resume point (their tokens are unchanged)
++                const bool dsp_keep = reused > 0 && reused == dsp_next;
++                const bool dsp_cut = !dsp_keep && dsp_resume > 0 && reused == dsp_resume && reused < dsp_next;
++                if (dsp && dsp_cut) dsp->truncate(reused);
++                else if (dsp && !dsp_keep) dsp->reset();
+                 dsp_next = -1;
++                dsp_whi = whi_base;   // (-1 unless resumed on the live caches) raised once this request's prompt is in
+                 sp_tail = std::min(128, delta);
+             }
+ #endif
+@@ -1684,6 +1723,12 @@
+                 continue;
+             }
+             hist = ids;
++#if defined(DS41_HAVE_DSPARK)
++            // the prompt wrote reused .. total - 1 in order; a resume on the live caches keeps the earlier passes' stale
++            // positions (whi_base) - they still count against the window slack of the next resume
++            if (dsp_path) dsp_whi = std::max(whi_base, total - 1);
++#endif
++            (void) whi_base; (void) dsp_resume;   // (unused without DS41_HAVE_DSPARK)
+             if (snapped) {   // before the last <｜Assistant｜>: no logits of its own (a repeated prompt re-feeds the tail)
+                 snap_len = snap_at;
+                 snap_logits.clear();
+@@ -1813,6 +1858,7 @@
+                     for (int i = 0; i < k; ++i) vt.push_back(dr[i]);
+                     const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
+                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
++                    dsp_whi = std::max(dsp_whi, p0 + (int) vt.size() - 1);   // rejected drafts' rows stay written (stale)
+                     int acc = 0, tn = -1;
+                     for (; acc < k; ++acc) {
+                         sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
+@@ -1862,6 +1908,9 @@
+                 ++pos;
+                 tier.rebalance_tick();
+             }
++#if defined(DS41_HAVE_DSPARK)
++            if (dsp_path && sp_t < 0 && dsp_whi >= 0) dsp_whi = std::max(dsp_whi, pos - 1);   // DSpark mode, decoded plainly
++#endif
+             const double dec_ms = now_ms() - td0;
+             const Ds41MoeStats st = tier.stats();
+             if (std::strcmp(finish, "error") == 0) {
+@@ -1869,6 +1918,9 @@
+                 hist.clear();
+                 snap_len = -1;
+                 finish = "length";
++#if defined(DS41_HAVE_DSPARK)
++                dsp_whi = -1;
++#endif
+             }
+             std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
+                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,

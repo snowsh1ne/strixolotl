@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# scripts/hf_upload - upload the folder scripts/hf_prepare built to an EXISTING Hugging Face model repo.  Run it
+# yourself, after `hf auth login` (write token) and after creating the repo; it never creates, renames or deletes
+# repos.  Run inside the xolotl-strix toolbox (it has huggingface_hub with hf_xet).  Resumable: re-run after any
+# failure; it lists the repo first and skips every part that is already there with the right size.
+#
+#   scripts/hf_upload --repo <hf-user>/<repo> [--dir DIR] [--keep-parts] [--message MSG] [--dry-run]
+#
+#   1. the small files in one commit (README.md = the model card, LICENSE, manifest.json, SHA256SUMS, rank, experts.json,
+#      tokenizer/, engram/ index + README); they are re-sent on every run, so a card edit is picked up
+#   2. each GGUF part in its own commit; the Hub's reported size is checked after each one.  A part that is not staged
+#      (copy mode) is cut from the GGUF, checked against its sha256, uploaded and deleted: one part of disk space.
+#   --keep-parts   keep the reflinked parts after their upload (they cost no space while the GGUF exists)
+#   --dry-run      list what is on the Hub and what is still to do; upload nothing
+#
+# Env: HF_XET_HIGH_PERFORMANCE=1 for maximum throughput (uses all bandwidth and cores).  On a home uplink upstream Xolotl
+# used HF_XET_FIXED_UPLOAD_CONCURRENCY=3 (xolotl/tools/v41/hf/upload-start.sh); set it if requests time out.
+# Long upload: setsid nohup scripts/hf_upload --repo ... > ~/.cache/xolotl/hf-upload.log 2>&1 < /dev/null &
+. "$(dirname "$0")/lib/common.sh"
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-$HOME/.cache/xolotl/pycache}"
+
+DIR="$XOLOTL_CACHE/hf-release/V41-1017-GSQ-217"
+ARGS=()
+REPO=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repo) REPO="$2"; shift ;;
+        --dir) DIR="$2"; shift ;;
+        --keep-parts) ARGS+=(--keep-parts) ;;
+        --message) ARGS+=(--message "$2"); shift ;;
+        --dry-run) ARGS+=(--dry-run) ;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
+[ -n "$REPO" ] || die "--repo <hf-user>/<repo> is required"
+case "$REPO" in *"<"*|*">"*) die "replace the placeholder in --repo $REPO with the real repo id" ;; esac
+[ -s "$DIR/manifest.json" ] || die "no $DIR/manifest.json: run scripts/hf_prepare first"
+grep -q 'TODO' "$DIR/README.md" && warn "$DIR/README.md (the model card) still has TODOs: fill hf/MODEL_CARD.md and re-run scripts/hf_prepare"
+
+exec "$(xolotl_python)" -I "$XOLOTL_REPO/scripts/lib/hf_release.py" upload --dir "$DIR" --repo "$REPO" "${ARGS[@]}"

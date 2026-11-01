@@ -1,0 +1,18 @@
+# scripts/github_export.exclude - what scripts/github_export leaves out of the public GitHub copy (rsync patterns,
+# relative to the repo root; a line starting with '+ ' keeps a path that a later pattern would drop).
+/claude_logs/            # the user's Claude Code transcripts (calibration data): private, 471 MB
+/Xolotl_Upstream/        # pristine upstream copy: link to github.com/Indras-Mirror/Xolotl instead
+/.dvconf                 # dv snapshot config of this machine
+/sess                    # personal notes (resume id, NAS mount)
+/CLAUDE.md               # instructions for agent sessions on this box (hostnames, NFS share)
+/STATUS.md               # the private lab log (user, 2026-11-01); its public summary is ROADMAP.md
+/HANDOFF.md              # session hand-off notes (internal)
+/docs/RENAME_CHECKLIST.md   # local rename plan (NAS paths, memory folders)
+/docs/GITHUB_PREP.md     # this release's own preparation notes
+/scripts/paths/V41-1017-kingston.paths   # this box's old drive layout
+/scripts/paths/V41-1017-200.paths        # GSQ-200, not released
++ /xolotl/bench/micro/   # the only part of upstream's bench/ the build uses (tests, parity fixtures)
+/xolotl/bench/*          # upstream's benchmark data (74 MB, other models / hardware; mostly binary): see upstream
+/xolotl/tools/taskeval/he/   # upstream's HumanEval dataset copy: its own Git LFS rules and only an LFS pointer, no data
+__pycache__/
+*.pyc

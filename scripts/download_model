@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# scripts/download_model - download the prequantized Strixolotl model (GSQ-217 of DeepSeek-V4.1-Flash-1017) from
+# Hugging Face, verify it, and write the .paths file that scripts/start_xolotl_dsv41 and scripts/verify_setup read.
+# No quantization and no full DeepSeek checkpoint needed.  Run inside the xolotl-strix toolbox (huggingface_hub +
+# hf_xet).  Resumable: re-run after any interruption.
+#
+#   scripts/download_model --repo <hf-user>/<repo> [--revision REV] [--engram-from deepseek|mirror]
+#                          [--engram-dir DIR [--verify-engram]] [--dry-run]
+#
+#   1. the GGUF (243.1 GB) in byte-range parts: each part is downloaded, checked against its sha256, appended at its
+#      offset into $XOLOTL_MODELS/V41-1017-GSQ/V41-1017-GSQ-217.gguf and deleted; then the whole file is checked
+#   2. rank-217.bin, the .experts.json, tokenizer/ (checked against manifest.json)
+#   3. the Engram tables: shards 47 + 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017 at a pinned revision (2 x 101.5 GB,
+#      sha256-checked) into $XOLOTL_MODELS/V41-1017-Engram, plus a minimal model.safetensors.index.json.
+#      --engram-from mirror: from the release repo, if it mirrors them.  --engram-dir DIR: you already have the full
+#      DeepSeek checkpoint (or the two shards + index) in DIR; nothing is downloaded for Engram.
+#   4. $XOLOTL_MODELS/V41-1017.paths (an existing one is kept as V41-1017.paths.bak-<time>)
+#
+# Disk: ~447 GB downloaded, ~457 GB free needed at the peak (the GGUF + one 10.7 GB part + Engram).  On btrfs the two
+# model folders get chattr +m (no compression) before anything is written: compressed extents break the engine's
+# O_DIRECT expert reads.  Models on NFS, SMB or exFAT are refused.
+. "$(dirname "$0")/lib/common.sh"
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-$HOME/.cache/xolotl/pycache}"
+
+ARGS=()
+REPO=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repo) REPO="$2"; shift ;;
+        --revision) ARGS+=(--revision "$2"); shift ;;
+        --engram-from) ARGS+=(--engram-from "$2"); shift ;;
+        --engram-dir) ARGS+=(--engram-dir "$(cd "$2" && pwd)"); shift ;;
+        --verify-engram) ARGS+=(--verify-engram) ;;
+        --dry-run) ARGS+=(--dry-run) ;;
+        -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
+[ -n "$REPO" ] || die "--repo <hf-user>/<repo> is required (the model card on Hugging Face names it)"
+case "$REPO" in *"<"*|*">"*) die "replace the placeholder in --repo $REPO with the real repo id" ;; esac
+xolotl_check_fs "$XOLOTL_MODELS"
+PY="$(xolotl_python)"
+"$PY" -I -c 'import huggingface_hub' 2>/dev/null || die "huggingface_hub is missing: run this inside the xolotl-strix toolbox (scripts/toolbox_create)"
+
+"$PY" -I "$XOLOTL_REPO/scripts/lib/hf_release.py" fetch --repo "$REPO" --models "$XOLOTL_MODELS" "${ARGS[@]}"
+case " ${ARGS[*]} " in *" --dry-run "*) exit 0 ;; esac
+say "next: scripts/verify_setup (on the host, server stopped), then scripts/start_xolotl_dsv41 --model 1017 (QUICKSTART.md)"

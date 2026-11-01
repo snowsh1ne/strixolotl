@@ -1,0 +1,78 @@
+# Xolotl on Strix Halo: the build + run toolbox.
+#
+# Fedora 44 + AMD ROCm 7.14 from AMD's multi-arch RPM repo (amdrocm-core-devel7.14-gfx1151: one tree under
+# /opt/rocm/core with clang, the device bitcode, HIP, hipBLAS/rocBLAS/hipBLASLt for gfx1151 and their CMake
+# configs), the C++ toolchain the engine build needs, and a Python venv with the server's packages and the
+# Hugging Face CLI.
+#
+# strix-port: this replaces the TheRock-wheel install.  It is the ROCm the box's qwen4exp / glm5next toolboxes
+# already build llama.cpp's ggml-hip with (~/src/toolbox-qwen4exp-opt/Dockerfile.rocm-7.14).  The first two RUN
+# layers below are kept byte-identical to theirs so podman reuses the cached 8.4 GB ROCm layer; don't reformat them.
+#
+#   scripts/toolbox_create          builds this image and creates the toolbox (podman + toolbox on the host)
+#   toolbox enter xolotl-strix      then scripts/build_xolotl, scripts/download_dsv41, scripts/start_xolotl_dsv41
+#
+# Nothing here is GPU-specific at build time: the image builds on any x86-64 Linux with podman.
+FROM registry.fedoraproject.org/fedora:44
+
+RUN <<'EOF'
+tee /etc/yum.repos.d/rocm.repo <<REPO
+[rocm]
+name=ROCm 7.14.0
+baseurl=https://repo.amd.com/rocm/packages-multi-arch/rhel10/x86_64
+enabled=1
+priority=50
+gpgcheck=1
+gpgkey=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
+REPO
+EOF
+
+RUN dnf -y --nodocs --setopt=install_weak_deps=False \
+  install \
+  make gcc gcc-c++ cmake libcurl-devel ninja-build rdma-core-devel \
+  amdrocm-core-devel7.14-gfx1151 \
+  git-core sudo rsync patch \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+
+ARG ROCM_GFX=gfx1151
+
+LABEL com.github.containers.toolbox="true" \
+      name="xolotl-strix" \
+      summary="Xolotl (DeepSeek-V4.1 MoE engine) build/run environment for AMD Strix Halo (gfx1151), ROCm 7.14"
+
+# The rest of the toolchain and what a toolbox and a debugging session want (fedora:44 is not the toolbox image).
+RUN dnf -y install --setopt=install_weak_deps=False \
+        libstdc++-devel python3 python3-pip python3-devel \
+        pciutils procps-ng util-linux iproute which findutils file curl jq \
+        numactl numactl-devel libdrm libdrm-devel libatomic elfutils-libelf zstd xz \
+        htop nvtop fio sysstat \
+        passwd shadow-utils libcap less vim-minimal bash-completion hostname \
+    && dnf clean all && rm -rf /var/cache/dnf/*
+
+# One ROCm: every lib dir in ld.so.conf, and the paths the engine build needs (clang, device bitcode, CMake
+# prefixes, hipBLASLt version) in /opt/xolotl/rocm.env.
+COPY rocm-discover.py /opt/xolotl/rocm-discover.py
+RUN python3 -I /opt/xolotl/rocm-discover.py --root /opt/rocm/core \
+        --gfx "${ROCM_GFX}" --rocm-version "$(rpm -q --qf '%{VERSION}' amdrocm-core-devel7.14-${ROCM_GFX})" \
+        --env /opt/xolotl/rocm.env --ldconf /etc/ld.so.conf.d/xolotl-rocm.conf \
+    && ldconfig \
+    && cat /opt/xolotl/rocm.env
+
+# The server's Python packages (xolotl/requirements.txt minus the build tools the image already has) + hf CLI.
+COPY requirements-serve.txt /opt/xolotl/requirements-serve.txt
+RUN python3 -m venv /opt/xolotl/venv \
+    && /opt/xolotl/venv/bin/pip install --no-cache-dir -U pip \
+    && /opt/xolotl/venv/bin/pip install --no-cache-dir -r /opt/xolotl/requirements-serve.txt
+
+# Interactive shells (toolbox enter) pick the environment up from here; the scripts source rocm.env themselves.
+COPY xolotl-env.sh /etc/profile.d/xolotl-env.sh
+
+ENV ROCM_PATH=/opt/rocm/core \
+    HIP_PATH=/opt/rocm/core \
+    HIP_PLATFORM=amd \
+    XOLOTL_TOOLBOX=1 \
+    XOLOTL_GFX=${ROCM_GFX} \
+    HSA_DISABLE_COREDUMP_ON_EXCEPTION=1 \
+    PATH=/opt/xolotl/venv/bin:/opt/rocm/core/bin:/opt/rocm/core/lib/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+
+CMD ["/bin/bash"]

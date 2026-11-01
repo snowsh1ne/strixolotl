@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# scripts/toolbox_create - build the xolotl-strix image (toolbox/Containerfile) and create the toolbox.  Run on the
+# Strix Halo host, outside any container.  Then:  toolbox enter xolotl-strix
+#
+#   scripts/toolbox_create [--rebuild] [--name NAME] [--quant]
+#
+# --quant: the quantization toolbox instead (xolotl-quant, toolbox/Containerfile.quant = this image + PyTorch for
+# gfx1151); builds the engine image first if it is missing.  --rebuild then rebuilds only the quant layer.
+#
+# A toolbox container is already privileged with the host's /dev (GPU: /dev/kfd, /dev/dri) and the host's ulimits
+# (memlock must be unlimited on the host: the engine pins its expert arena), like the halogen toolbox.  toolbox
+# create takes no extra podman arguments, so there is nothing to add here.
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+NAME=xolotl-strix
+IMAGE="${XOLOTL_IMAGE:-localhost/xolotl-strix:rocm7.14}"
+REBUILD=0
+QUANT=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --rebuild) REBUILD=1 ;;
+        --name) NAME="$2"; shift ;;
+        --quant) QUANT=1 ;;
+        -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+[ -z "${TOOLBOX_PATH:-}" ] && [ ! -e /run/.toolboxenv ] || { echo "run this on the host, not inside a toolbox" >&2; exit 1; }
+command -v podman >/dev/null || { echo "podman is needed (dnf install podman toolbox)" >&2; exit 1; }
+command -v toolbox >/dev/null || { echo "toolbox is needed (dnf install toolbox)" >&2; exit 1; }
+
+if [ "$QUANT" = 1 ]; then
+    BASE="$IMAGE"
+    [ "$NAME" = xolotl-strix ] && NAME=xolotl-quant
+    IMAGE="${XOLOTL_QUANT_IMAGE:-localhost/xolotl-quant:rocm7.14-torch2.11}"
+    if ! podman image exists "$BASE"; then
+        echo "[xolotl] building the base $BASE first"
+        podman build -t "$BASE" -f "$REPO/toolbox/Containerfile" "$REPO/toolbox"
+    fi
+    if [ "$REBUILD" = 1 ] || ! podman image exists "$IMAGE"; then
+        echo "[xolotl] building $IMAGE on $BASE (downloads PyTorch for gfx1151, a few GB)"
+        podman build -t "$IMAGE" --build-arg BASE="$BASE" -f "$REPO/toolbox/Containerfile.quant" "$REPO/toolbox"
+    fi
+elif [ "$REBUILD" = 1 ] || ! podman image exists "$IMAGE"; then
+    echo "[xolotl] building $IMAGE (the ROCm layer is shared with the qwen4exp/glm5next images)"
+    podman build -t "$IMAGE" -f "$REPO/toolbox/Containerfile" "$REPO/toolbox"
+fi
+
+if podman container exists "$NAME"; then
+    if [ "$REBUILD" = 1 ]; then
+        echo "[xolotl] removing the old toolbox $NAME"
+        toolbox rm -f "$NAME"
+    else
+        echo "[xolotl] toolbox $NAME exists (scripts/toolbox_create --rebuild makes a new one)"
+        echo "  toolbox enter $NAME"
+        exit 0
+    fi
+fi
+
+[ "$(ulimit -l)" = unlimited ] || echo "[xolotl] warning: host memlock is $(ulimit -l) KiB, not unlimited; the arena falls back to unpinned" >&2
+toolbox create "$NAME" --image "$IMAGE"
+echo "[xolotl] created. Next:"
+echo "  toolbox enter $NAME"
+[ "$QUANT" = 1 ] && { echo "  python3 -I /opt/xolotl/torch-check.py"; exit 0; }
+echo "  cd $REPO && scripts/build_xolotl && scripts/download_dsv41 && scripts/start_xolotl_dsv41"

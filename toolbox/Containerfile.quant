@@ -1,0 +1,33 @@
+# Xolotl on Strix Halo: the quantization toolbox = the xolotl-strix image + PyTorch for gfx1151.
+#
+# For tools/v41's GSQ pipeline (calibration, GPTQ, GGUF writing) on DeepSeek-V4.1-Flash-1017.  Built FROM the
+# engine image, so its ROCm 7.14 RPM layer, toolchain and venv are reused unchanged and the engine toolbox
+# (xolotl-strix) stays as it is.
+#
+# torch comes from AMD's stable gfx1151 wheel index (TheRock build).  It brings its own ROCm 7.13 user-space
+# libraries as pip packages (rocm-sdk-core, rocm-sdk-libraries-gfx1151) and loads those, not /opt/rocm/core.
+# torch >= 2.10 is what DeepSeek's inference/model.py asks for (float8_e8m0fnu / float4_e2m1fn_x2 dtypes).
+#
+#   scripts/toolbox_create --quant    builds this image (and the base if missing) and creates the toolbox
+#   toolbox enter xolotl-quant        then: python3 -I /opt/xolotl/torch-check.py
+ARG BASE=localhost/xolotl-strix:rocm7.14
+FROM ${BASE}
+
+ARG TORCH_INDEX=https://repo.amd.com/rocm/whl/gfx1151/
+ARG TORCH_VERSION=2.11.0+rocm7.13.0
+
+LABEL com.github.containers.toolbox="true" \
+      name="xolotl-quant" \
+      summary="Xolotl DeepSeek-V4.1 quantization toolbox for AMD Strix Halo (gfx1151): ROCm 7.14 + PyTorch ${TORCH_VERSION}"
+
+# torch and its dependencies only from AMD's index (it carries all of them), so nothing from PyPI can replace the
+# ROCm build with a CUDA/CPU one.
+RUN /opt/xolotl/venv/bin/pip install --no-cache-dir --index-url "${TORCH_INDEX}" "torch==${TORCH_VERSION}"
+
+COPY requirements-quant.txt /opt/xolotl/requirements-quant.txt
+RUN /opt/xolotl/venv/bin/pip install --no-cache-dir -r /opt/xolotl/requirements-quant.txt \
+    && /opt/xolotl/venv/bin/python -c "import torch; assert torch.version.hip, torch.__version__; print('torch', torch.__version__, 'hip', torch.version.hip)"
+
+COPY torch-check.py /opt/xolotl/torch-check.py
+
+ENV XOLOTL_QUANT=1

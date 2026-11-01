@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# scripts/start_xolotl_dsv41 - serve DeepSeek-V4.1-Flash on Strix Halo: the OpenAI / Anthropic-compatible server
+# (xolotl/tools/v41/serve/serve_ds41.py) in front of ds41_generate, in the foreground, with the engine's own log
+# streamed to this terminal (like running llama-server).  Ctrl-C stops both.  Run inside the toolbox.
+#
+#   scripts/start_xolotl_dsv41 [--port 8150] [--host 0.0.0.0 | --local] [--no-auth | --api-key KEY] [--long | --no-long | --ctx N]
+#                              [--model 1017|v41] [--dspark | --no-dspark] [--prompt-batch 8192] [--tool-parse auto|always]
+#                              [--fast-prefill] [--no-pred-reads] [--dry-run] [-- extra engine args]
+#
+#   Defaults (2026-10-31, the configuration the project is served and measured with): --model 1017, --host 0.0.0.0
+#   --no-auth (an unauthenticated LAN server: never forward a port to it), --long, --dspark, predicted reads.
+#   XOLOTL_MODEL / XOLOTL_HOST / XOLOTL_NO_AUTH / XOLOTL_CTX / XOLOTL_DSPARK / XOLOTL_PRED_READS change these defaults.
+#
+#   --local        listen on 127.0.0.1 only (with --api-key KEY: a key is required)
+#   --api-key KEY  require the key (STRATA_API_KEY); turns the --no-auth default off
+#   --long         long-context mode (default): --ctx 1048576, the model's full window (ROADMAP "Long-context mode")
+#   --no-long      --ctx 262144 (the previous default; less memory for the attention span graph at depth)
+#   --tool-parse   auto: DSML tool calls become tool_calls only for requests that declare tools (else they stay in the
+#                  content as written); always: whatever the request declares (the server's default when not given)
+#   --dspark       DSpark speculative decode (the MTP sidecar XOLOTL_DSV41_DSPARK of the paths file; its experts
+#                  requantized to iq3_xxs on load, depth 4, confidence gate 0.6). One-shot 2026-10-27: ~+15-19% decode,
+#                  same output distribution, but NOT bit-identical to plain decode (batched verify arithmetic; ~2.6%
+#                  of greedy tokens differ at near-ties). On by default since 2026-10-31 (XOLOTL_DSPARK=0 flips it)
+#   --no-dspark    plain decode (~9 instead of ~11 tok/s; bit-identical to verify_setup's reference path)
+#   --fast-prefill MMQ expert kernels for prompt batches (--chunk-mmq) with the MMVQ path's q8_1 activation values
+#                  (STRATA_MMQ_ACT_MMVQ=1): 8K prompt 138 -> 60 s, TTFT +6.5K 84 -> 39 s (2026-10-29). NOT bit-identical;
+#                  17-row A/B vs MMVQ: ppl +0.12% (CI -0.89..+1.26%), top-1 0.8737 -> 0.8732 (docs/PREFILL.md).  Off by
+#                  default (XOLOTL_FAST_PREFILL=1 flips the default)
+#   --no-pred-reads  turn off the predicted reads (on by default since 2026-10-30): the file-tier experts the previous
+#                  batch routed are read while each layer's dense half runs (STRATA_PF_PRED_GIB, XOLOTL_PRED_READS_GIB =
+#                  1.5). Bit-identical (serve logit dumps), -2..-7 s per agent turn; keeps 1.5 GiB pinned, given back
+#                  for a batch that would not fit next to it (decode at 15K: misses +2.1%, -1.6% tok/s, one run).
+#                  XOLOTL_PRED_READS=0 flips the default; --pred-reads turns it back on
+#   --dry-run      write the config and print the commands, start nothing
+#   -- ARGS        appended to the engine's arguments (e.g. -- --uma-reserve-gib 32 --route-bias 0)
+#
+# Environment: XOLOTL_MODELS, XOLOTL_BUILD_DIR, XOLOTL_STATE (scripts/lib/common.sh); any STRATA_* engine variable
+# (tools/v41/serve/ds41-engine-strix.sh) is passed through.
+. "$(dirname "$0")/lib/common.sh"
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-$HOME/.cache/xolotl/pycache}"   # no __pycache__ on the NFS share
+
+PORT=8150
+HOST="${XOLOTL_HOST:-0.0.0.0}"
+API_KEY="${STRATA_API_KEY:-}"
+NO_AUTH="${XOLOTL_NO_AUTH:-1}"
+[ -n "$API_KEY" ] && NO_AUTH=0
+CTX="${XOLOTL_CTX:-1048576}"
+MODEL="${XOLOTL_MODEL:-1017}"
+DSPARK="${XOLOTL_DSPARK:-1}"   # the default; --dspark / --no-dspark override it
+FAST_PREFILL="${XOLOTL_FAST_PREFILL:-0}"
+PRED_READS="${XOLOTL_PRED_READS:-1}"
+PB="${XOLOTL_PROMPT_BATCH:-8192}"
+DRY=0
+TOOL_PARSE=
+EXTRA=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --port) PORT="$2"; shift ;;
+        --host) HOST="$2"; shift ;;
+        --local) HOST=127.0.0.1 ;;
+        --api-key) API_KEY="$2"; NO_AUTH=0; shift ;;
+        --no-auth) NO_AUTH=1 ;;   # bind beyond localhost WITHOUT a key (LAN only; no port forwarding to this box)
+        --ctx) CTX="$2"; shift ;;
+        --long) CTX=1048576 ;;
+        --no-long) CTX=262144 ;;
+        --model) MODEL="$2"; shift ;;
+        --dspark) DSPARK=1 ;;
+        --no-dspark) DSPARK=0 ;;
+        --fast-prefill) FAST_PREFILL=1 ;;
+        --pred-reads) PRED_READS=1 ;;
+        --no-pred-reads) PRED_READS=0 ;;
+        --prompt-batch) PB="$2"; shift ;;
+        --tool-parse) TOOL_PARSE="$2"; shift ;;
+        --dry-run) DRY=1 ;;
+        --) shift; EXTRA=("$@"); break ;;
+        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
+case "$TOOL_PARSE" in ""|auto|always) ;; *) die "--tool-parse auto or always" ;; esac
+case "$MODEL" in v41) NAME=V41 ;; 1017) NAME=V41-1017 ;; *) die "--model v41 or 1017" ;; esac
+if [ "$HOST" != 127.0.0.1 ] && [ "$HOST" != localhost ] && [ -z "$API_KEY" ] && [ "$NO_AUTH" != 1 ]; then
+    die "--host $HOST exposes the server beyond this machine: set --api-key (or STRATA_API_KEY), or --no-auth for an unauthenticated LAN server"
+fi
+
+xolotl_rocm_env
+[ "$DRY" = 1 ] || xolotl_check_gpu
+PATHS="$XOLOTL_MODELS/$NAME.paths"
+[ -r "$PATHS" ] || die "no $PATHS: run scripts/download_model --repo <hf-repo> first (1017; QUICKSTART.md), or scripts/download_dsv41 for --model v41"
+# shellcheck disable=SC1090
+. "$PATHS"
+for f in "$XOLOTL_DSV41_GGUF" "$XOLOTL_DSV41_RANK"; do [ -s "$f" ] || die "missing $f (scripts/download_model, QUICKSTART.md)"; done
+[ -d "$XOLOTL_DSV41_TOKENIZER" ] || die "missing $XOLOTL_DSV41_TOKENIZER"
+EXE="$XOLOTL_SRC/tools/v41/serve/ds41-engine-strix.sh"
+[ -x "$XOLOTL_BUILD_DIR/ds41_generate" ] || [ "$DRY" = 1 ] || die "no $XOLOTL_BUILD_DIR/ds41_generate: run scripts/build_xolotl"
+
+mkdir -p "$XOLOTL_STATE/logs"
+CFG="$XOLOTL_STATE/strata-ds41-strix.json"
+LOG="$XOLOTL_STATE/logs/ds41-engine.log"
+TEXT_LOG="$XOLOTL_STATE/logs/ds41-text.log"
+
+# The engine's arguments: upstream's served config (tools/v41/serve/strata-ds41.json) with the Strix changes -
+#   --uma on                the unified-memory sizing (arena from MemAvailable, small expert cache, budgets bounded
+#                           by host RAM; ds41_generate.cpp --uma)
+#   --pcie 1, --tier-batch-pcie 1   every expert runs on the GPU: there is no PCIe to save, and the CPU pool would
+#                           compete with the GPU for the same memory bandwidth
+#   no --arena-gib          UMA sizes it (MemAvailable - reserve - cache); upstream's 64 GiB was a 90 GB box
+#   --ctx 262144            half of upstream's 512K for the first runs (--ctx 524288 for the full window)
+#   --prompt-batch 8192     the engine default (upstream's 12288 is tuned to a 24 GB card)
+#   --uma-reserve-gib 24    measured 2026-10-21 with the quality-mode dense half (file Q8_0, no requant): an 8192-token
+#                           prompt batch uses ~14.5 GiB beyond the arena (q6_K: ~10), and runs stall when MemAvailable
+#                           nears ~6 GiB - arena 90 GiB stalled, 86 worked (min free 8.5 GiB, slower prefill), 82 worked
+#                           (12.4). 24 -> ~85 GiB arena at the usual ~109 GiB after the dense half. Raise to 26 if a long
+#                           prompt ever stalls; DSpark: 30 (its iq3_xxs drafter pins ~5.5 GiB; arena ~79 as measured one-shot). (q6_K dense in speed mode would allow ~16.)
+#   --uma-cache-gib 0, --pf-b 0 + zero-copy (STRATA_UMA_ZEROCOPY=1): on UMA the expert cache and the prefetch staging are
+#                           second RAM copies; the kernels read arena slots in place instead (bit-identical tokens,
+#                           expert tier -42 ms/token, 2026-10-21)
+#   STRATA_DENSE_REQUANT=   quality mode: the dense half stays the file's Q8_0 (the wrapper's default re-quantizes it
+#                           to q6_K, an upstream speed choice; q6_K/q5_K/q4_K are speed-mode TODO options)
+#   --no-chunk-mmq          the prompt batches run the MMVQ expert kernels (the verified numerics).  The 8192 fault of
+#                           the MMQ path (mul_mat_q<Q3_K,128>: id buffers without slack) is fixed (2026-10-29), and MMQ
+#                           is ~6x faster per token-expert pair, but not bit-identical: opt in with --fast-prefill
+ENGINE_ARGS=(
+    -m "$XOLOTL_DSV41_GGUF"
+    --backend cuda --experts gpu
+    --engram "$XOLOTL_DSV41_ENGRAM"
+    --rank "$XOLOTL_DSV41_RANK"
+    --ctx "$CTX"
+    --stop 1
+    --arena-adapt
+    --kv-fp4
+    --route-bias 0 --route-bias-file 0
+    --prompt-batch "$PB"
+    --uma on --uma-reserve-gib "$([ "$DSPARK" = 1 ] && echo 30 || echo 24)" --uma-cache-gib 0
+    --pf-b 0
+    "$([ "$FAST_PREFILL" = 1 ] && echo --chunk-mmq || echo --no-chunk-mmq)"
+    --pcie 1 --tier-batch-pcie 1
+    "${EXTRA[@]}"
+)
+ENV_JSON="{}"
+if [ "$DSPARK" = 1 ]; then
+    [ -s "${XOLOTL_DSV41_DSPARK:-}" ] || die "--dspark: no MTP sidecar (XOLOTL_DSV41_DSPARK) in $PATHS (xolotl/tools/v41/v41_sidecar.py --no-vision)"
+    # 2026-10-27 one-shot sweep: depth 4 + gate 0.6-0.7 beat depth 2/3 and gate 0.5; iq3_xxs keeps the
+    # acceptance of the MXFP4 file and frees ~2 GB of GTT for the arena
+    # a sidecar written by v41_sidecar_requant (*.IQ3_XXS.gguf, *.Q2_K.gguf, ...) is used as is; the MXFP4 one is
+    # requantized to iq3_xxs on load (~77 s at the first request)
+    case "$(basename "$XOLOTL_DSV41_DSPARK")" in *.IQ*.gguf|*.Q[0-9]_K.gguf) XT_DEF="" ;; *) XT_DEF=iq3_xxs ;; esac
+    ENV_JSON="$(jq -n --arg s "$XOLOTL_DSV41_DSPARK" --arg t "${XOLOTL_DSPARK_EXP_TYPE-$XT_DEF}" --arg c "${XOLOTL_DSPARK_CONF:-0.6}" \
+        --arg k "${XOLOTL_DSPARK_KEEP:-$XOLOTL_SRC/tools/v41/serve/dspark_expert_counts_1017.txt:64}" \
+        '{STRATA_SERVE_DSPARK: $s, STRATA_DSPARK_DEPTH: "4", STRATA_DSPARK_CONF: $c, STRATA_DSPARK_EXP_TYPE: $t, STRATA_DSPARK_KEEP: $k}
+         | if .STRATA_DSPARK_EXP_TYPE == "" then del(.STRATA_DSPARK_EXP_TYPE) else . end')"
+    # STRATA_DSPARK_KEEP: the drafter keeps its 64 most-used experts per block (1017 counts from agent8k + code8k, 2026-10-28;
+    # the wrapper's default is upstream's V4.1 counts): 3.3 GB on GTT instead of 5.9, acceptance 3.1 -> 2.5 tokens/pass,
+    # file reads/token 18.2 -> 15.5, about the same tok/s with fewer KFD stalls
+fi
+# the build folder and the hipBLASLt table reach the engine through the config's env
+ENV_JSON="$(echo "$ENV_JSON" | jq --arg b "$XOLOTL_BUILD_DIR" '. + {STRATA_BUILD_DIR: $b}')"
+# quality mode (lossless): no dense requant, zero-copy arena reads, no prefetch staging copies
+ENV_JSON="$(echo "$ENV_JSON" | jq '. + {STRATA_DENSE_REQUANT: "", STRATA_UMA_ZEROCOPY: "1", STRATA_PF_NO_DUMMY: "1"}')"
+# quality mode fidelity (2026-10-21, closer to model.py; measured as the distance to the exact torch GSQ chain): FP8 o
+# before wo_a, BF16 index scores, F32 accumulation for F16-weight prefill GEMMs, an F16 head (+0.6 GB, ~2.5 ms/token)
+ENV_JSON="$(echo "$ENV_JSON" | jq '. + {STRATA_DBG_OQUANT: "1", STRATA_IDX_BF16: "1", STRATA_DBG_PREC32: "1", STRATA_DENSE_F16: "output.weight"}')"
+# file-tier read path (ROADMAP "File-tier read path (2026-10-25)"; bit-identical across all three, and
+# identical to verify_setup's reference path): file misses read early by a persistent pool straight into their arena
+# slot and run on the GPU (not the CPU pool); arena eviction by decayed use count; +10 GiB of arena slots in decode
+# (released before a prompt batch, MemAvailable floor 9 GiB).  Warm bench: misses -28%, decode +4-7% (drive-bound).
+ENV_JSON="$(echo "$ENV_JSON" | jq '. + {STRATA_FILE_FAST: "1", STRATA_ARENA_LFU: "0.995", STRATA_ARENA_EXT_GIB: "10"}')"
+# DSpark: a verify call covers ~3 tokens, so the per-call LFU decay is 0.995^3 ~ 0.985 (2026-10-28, same 1200 tokens:
+# file reads/token 18.2 -> 17.5)
+[ "$DSPARK" = 1 ] && ENV_JSON="$(echo "$ENV_JSON" | jq '. + {STRATA_ARENA_LFU: "0.985"}')"
+# --fast-prefill: MMQ for the prompt's experts with the MMVQ path's activation values (17 rows: +0.12%, CI -0.89..+1.26%;
+# ggml's own MMQ quantizer measured +0.97%, CI +0.17..+2.15% - most likely model-amplified noise, docs/PREFILL.md)
+[ "$FAST_PREFILL" = 1 ] && ENV_JSON="$(echo "$ENV_JSON" | jq '. + {STRATA_MMQ_ACT_MMVQ: "1"}')"
+[ "$PRED_READS" = 1 ] && ENV_JSON="$(echo "$ENV_JSON" | jq --arg g "${XOLOTL_PRED_READS_GIB:-1.5}" '. + {STRATA_PF_PRED_GIB: $g}')"
+TABLE="$XOLOTL_SRC/tools/hip/gfx1151-hipblaslt-${XOLOTL_HIPBLASLT_VERSION:-unknown}.txt"
+if [ -n "${XOLOTL_HIPBLASLT_VERSION:-}" ] && [ -r "$TABLE" ]; then
+    ENV_JSON="$(echo "$ENV_JSON" | jq --arg t "$TABLE" '. + {STRATA_HIPBLASLT_TUNING: $t}')"
+fi
+
+jq -n \
+    --arg exe "$EXE" --arg cwd "$XOLOTL_SRC" --arg tok "$XOLOTL_DSV41_TOKENIZER" --arg log "$LOG" \
+    --argjson port "$PORT" --argjson env "$ENV_JSON" \
+    --args '{
+        exe: $exe, args: $ARGS.positional, cwd: $cwd, tokenizer: $tok,
+        model_name: "strixolotl-v4.1-flash", log: $log, port: $port,
+        backend: "hip", gpu: 0, env: $env,
+        sampling: {temperature: 1, top_p: 0.95},
+        api_monitor: true, reasoning_budget_tokens: 32768
+    }' -- "${ENGINE_ARGS[@]}" > "$CFG"   # --: jq would read the engine's -m as its own option
+# --no-auth: a plain LAN server - answer under any host name (strixhalo, IPs), no DNS-rebinding check
+[ "$NO_AUTH" = 1 ] && { jq '. + {allowed_hosts: "*"}' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"; }
+
+SERVE=("$(xolotl_python)" "$XOLOTL_SRC/tools/v41/serve/serve_ds41.py" --engine strata --config "$CFG"
+       --port "$PORT" --host "$HOST")
+[ -n "$API_KEY" ] && SERVE+=(--api-key "$API_KEY")
+[ -n "$TOOL_PARSE" ] && SERVE+=(--tool-parse "$TOOL_PARSE")
+
+GTT="$(xolotl_gtt_gib)"
+say "DeepSeek-V4.1-Flash ($XOLOTL_DSV41_NAME) on $(uname -n): GTT ${GTT} GiB, MemAvailable $(xolotl_memavail_gib) GiB, ctx $CTX, DSpark $([ "$DSPARK" = 1 ] && echo on || echo off)"
+[ "$GTT" -gt 0 ] && [ "$GTT" -lt 100 ] && warn "GTT is ${GTT} GiB: the arena + expert tier want ~110 GiB (kernel cmdline: amdgpu.gttsize / ttm.pages_limit, QUICKSTART.md)"
+say "config $CFG"
+say "engine log $LOG (streamed below), text log $TEXT_LOG"
+say "API: http://$HOST:$PORT/v1 (OpenAI), http://$HOST:$PORT/v1/messages (Anthropic)"
+if [ "$DRY" = 1 ]; then
+    cat "$CFG"
+    echo "${SERVE[*]}"
+    exit 0
+fi
+
+export STRATA_TEXT_LOG="$TEXT_LOG"
+: >> "$LOG"
+# the engine writes to its log file (the server reads it for its own status lines); show it here as it grows
+tail -n 0 -F "$LOG" &
+TAIL=$!
+trap 'kill "$TAIL" 2>/dev/null' EXIT
+trap 'kill -INT "$SRV" 2>/dev/null' INT TERM
+"${SERVE[@]}" &
+SRV=$!
+wait "$SRV"
+RC=$?
+# a second wait: the INT trap above interrupts the first one
+wait "$SRV" 2>/dev/null || true
+exit "$RC"

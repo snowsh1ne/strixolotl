@@ -1,0 +1,9 @@
+# The quantization pipeline's Python packages (tools/v41: v41_calib / v41_quant / v41_gptq / build_corpus and
+# DeepSeek's inference/model.py), on top of requirements-serve.txt.  torch itself is installed separately from
+# AMD's gfx1151 wheel index (Containerfile.quant).  gguf is NOT here: v41_sidecar.py imports the patched llama.cpp's
+# gguf-py, which knows the Xolotl tensor types.
+safetensors>=0.7.0
+tokenizers
+transformers
+datasets
+Pillow

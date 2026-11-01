@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# scripts/fetch_1017_fp8 - download the deepseek-ai/DeepSeek-V4.1-Flash-1017 FP8 checkpoint (the quantization source)
+# into $XOLOTL_MODELS/DeepSeek-V4.1-Flash-1017, sha256-verified and resumable (upstream's fetch_v41_loop.sh: every
+# file gets a <file>.ok marker, which is what v41_calib.py / calib_layers.sh wait for), and stop at a deadline.
+# Run on the host or in a toolbox (needs curl, python3, dd, sha256sum).
+#
+#   scripts/fetch_1017_fp8 [--no-engram | --engram | --all] [--until HH:MM] [--jobs N]
+#
+#   --no-engram (default)  everything except shards 47/48 (the two ~101.5 GB Engram tables), ~313 GB
+#   --engram               only shards 47/48 (calibration needs them from layer 1 on), ~203 GB
+#   --all                  all 510 GB (476 GiB on disk)
+#   --until HH:MM          stop cleanly at that local time (next occurrence); partial files resume on the next run
+#   --jobs N               files at a time (default 2)
+# Log: <dest>/fetch.log.  Exit 0 = all verified, 3 = stopped at the deadline, else the fetch loop's exit code.
+set -u
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LOOP="$REPO_DIR/xolotl/tools/v41/fetch_v41_loop.sh"
+DEST="${XOLOTL_MODELS:-$HOME/models/xolotl}/DeepSeek-V4.1-Flash-1017"
+HF_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017
+ENGRAM='model-0004[78]-of-00048'
+MODE=no-engram UNTIL="" JOBS=2
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-engram) MODE=no-engram ;;
+        --engram) MODE=engram ;;
+        --all) MODE=all ;;
+        --until) UNTIL="$2"; shift ;;
+        --jobs) JOBS="$2"; shift ;;
+        -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+unset ONLY SKIP
+case $MODE in
+    no-engram) export SKIP="$ENGRAM" ;;
+    engram) export ONLY="$ENGRAM" ;;
+esac
+export JOBS
+mkdir -p "$DEST"
+LOG="$DEST/fetch.log"
+log() { echo "$(date '+%F %T') [fetch_1017_fp8] $*" | tee -a "$LOG"; }
+
+deadline=0
+if [ -n "$UNTIL" ]; then
+    deadline=$(date -d "$UNTIL" +%s) || exit 2
+    [ "$deadline" -le "$(date +%s)" ] && deadline=$(date -d "tomorrow $UNTIL" +%s)
+fi
+log "start: $MODE -> $DEST, jobs $JOBS, deadline $([ "$deadline" -gt 0 ] && date -d "@$deadline" '+%F %T' || echo none)"
+
+# own session = own process group, so the deadline stops the loop, fetch_v41.sh, xargs and every curl together
+setsid bash "$LOOP" "$DEST" "$HF_REPO" >> "$LOG" 2>&1 < /dev/null &
+pid=$!
+trap 'kill -TERM -- "-$pid" 2>/dev/null; log "interrupted"; exit 130' INT TERM
+while kill -0 "$pid" 2>/dev/null; do
+    if [ "$deadline" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then
+        kill -TERM -- "-$pid" 2>/dev/null; sleep 20; kill -KILL -- "-$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        log "stopped at the deadline: $(ls "$DEST" | grep -c '\.safetensors\.ok$') shards verified, $(du -sh "$DEST" | cut -f1) on disk"
+        exit 3
+    fi
+    sleep 30
+done
+wait "$pid"; rc=$?
+log "fetch loop ended rc=$rc: $(ls "$DEST" | grep -c '\.safetensors\.ok$') shards verified, $(du -sh "$DEST" | cut -f1) on disk"
+exit "$rc"

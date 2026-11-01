@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# scripts/strix_mem_profile apply|revert|show - the memory settings that stop KFD queue evictions on strixhalo
+# (docs/UMA_DEEP_DIVE.md R1, 2026-10-28).  Needs root (sudo); run on the host, not in a toolbox.  Nothing persists:
+# a reboot (or `revert`) restores the defaults.
+#
+# Why: the engine's 80 GiB arena is GPU-mapped host memory.  Whenever the kernel moves one of its pages (zram
+# swap-out, compaction migration), amdgpu evicts ALL of the process's GPU queues until the mapping is re-validated:
+# 67-144 s of evicted_ms per 3-4 min run, 8-22 s stalls at decode start.  The engine mlocks the arena (no swap-out
+# since 2026-10-28), but compaction may still migrate mlocked pages unless compact_unevictable_allowed=0.
+# zram stays on (the box's OOM fallback for compiles): the mlocked arena is never swapped, other pages may be.
+#
+#   apply    compaction_proactiveness 0, watermark_boost_factor 0, compact_unevictable_allowed 0
+#            (the previous values are saved to ~/.cache/xolotl/mem_profile.saved)
+#   revert   restores the saved values
+#   show     prints the current values
+set -euo pipefail
+SAVED="${HOME}/.cache/xolotl/mem_profile.saved"
+KEYS=(vm.compaction_proactiveness vm.watermark_boost_factor vm.compact_unevictable_allowed)
+show() { for k in "${KEYS[@]}"; do sysctl "$k"; done; swapon --show; }
+case "${1:-show}" in
+    apply)
+        mkdir -p "$(dirname "$SAVED")"
+        [ -s "$SAVED" ] || { for k in "${KEYS[@]}"; do sysctl -n "$k" | sed "s|^|$k=|"; done > "$SAVED"; }
+        sudo sysctl -q vm.compaction_proactiveness=0 vm.watermark_boost_factor=0 vm.compact_unevictable_allowed=0
+        show ;;
+    revert)
+        [ -s "$SAVED" ] || { echo "no $SAVED (nothing applied)" >&2; exit 1; }
+        sudo sysctl -q $(tr '\n' ' ' < "$SAVED")
+        rm -f "$SAVED"
+        show ;;
+    show) show ;;
+    *) sed -n '2,15p' "$0"; exit 2 ;;
+esac

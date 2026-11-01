@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# scripts/download_dsv41 - download DeepSeek-V4.1-Flash (Xolotl's GSQ quant) and its Engram tables into
+# $XOLOTL_MODELS (default ~/models/xolotl), resumably.  Run inside the toolbox (it needs the hf CLI and python).
+#
+#   scripts/download_dsv41 [--model v41|1017] [--repo HF_REPO] [--engram-repo HF_REPO] [--keep-sources] [--dry-run]
+#
+#   --model v41    (default) IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored, 152 GiB, Engram from dealignai's FP8
+#   --model 1017   DeepSeek-V4.1-Flash-1017: IndrasMirror had not published its quant on 2026-10-18 ("up in a few
+#                  days", upstream's hand-off notes); pass --repo <the quant's repo> once it is up.  Its Engram tables are NOT
+#                  the V4.1 ones (all 48 shards differ, docs/ds4/V41_1017_QUANT_PLAN.md), so they come from
+#                  deepseek-ai/DeepSeek-V4.1-Flash-1017 unless --engram-repo says otherwise.
+#
+# Steps (each one is skipped when its result is already there, so a re-run resumes):
+#   1. the Engram shards 47 + 48 (2 x 101.5 GB) + index -> $XOLOTL_MODELS/<name>-FP8-engram
+#   2. extract the two Engram tables -> $XOLOTL_MODELS/<name>-Engram/{a,b} (~196 GB), then delete the shards
+#   3. the quant's repo (16 GGUF parts, rank.bin, tokenizer, DSpark Q2_K sidecar) -> $XOLOTL_MODELS/<name>-GSQ
+#   4. join the parts into one GGUF, checking every part and the result against SHA256SUMS, deleting each part
+#      once appended
+#   5. write $XOLOTL_MODELS/<name>.paths, which scripts/start_xolotl_dsv41 reads
+# Engram goes first so the disk peaks at ~400 GB instead of ~560 GB; the end state is ~370 GB.
+. "$(dirname "$0")/lib/common.sh"
+
+MODEL=v41
+REPO=""
+ENGRAM_REPO=""
+KEEP=0
+DRY=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --model) MODEL="$2"; shift ;;
+        --repo) REPO="$2"; shift ;;
+        --engram-repo) ENGRAM_REPO="$2"; shift ;;
+        --keep-sources) KEEP=1 ;;
+        --dry-run) DRY=1 ;;
+        -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
+
+case "$MODEL" in
+    v41)
+        NAME=V41
+        REPO="${REPO:-IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored}"
+        ENGRAM_REPO="${ENGRAM_REPO:-dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8}"
+        ;;
+    1017)
+        NAME=V41-1017
+        [ -n "$REPO" ] || die "--model 1017 needs --repo <HF repo of the 1017 GSQ quant> (not published as of 2026-10-18; check https://huggingface.co/IndrasMirror)"
+        ENGRAM_REPO="${ENGRAM_REPO:-deepseek-ai/DeepSeek-V4.1-Flash-1017}"
+        ;;
+    *) die "--model v41 or 1017" ;;
+esac
+
+PY="$(xolotl_python)"
+HF="$(command -v hf || true)"
+[ -n "$HF" ] || die "the hf CLI is missing (it is in the toolbox's venv: run this inside toolbox enter xolotl-strix)"
+xolotl_check_fs "$XOLOTL_MODELS"
+
+GSQ="$XOLOTL_MODELS/$NAME-GSQ"
+FP8="$XOLOTL_MODELS/$NAME-FP8-engram"
+ENG="$XOLOTL_MODELS/$NAME-Engram"
+PATHS="$XOLOTL_MODELS/$NAME.paths"
+
+need_gb() {   # need_gb <GB> <what>
+    local free
+    free="$(xolotl_free_gb "$XOLOTL_MODELS")"
+    if [ "$free" -lt "$1" ]; then
+        die "$2 needs ~$1 GB free in $XOLOTL_MODELS, $free GB are free"
+    fi
+}
+run() { say "+ $*"; [ "$DRY" = 1 ] || "$@"; }
+
+say "model $MODEL: quant $REPO, Engram $ENGRAM_REPO -> $XOLOTL_MODELS ($(xolotl_free_gb "$XOLOTL_MODELS") GB free)"
+
+# ---- 1 + 2: Engram ----------------------------------------------------------------------------------------------
+eng_ok() { [ -s "$ENG/a/model.safetensors.index.json" ] && [ -s "$ENG/b/model.safetensors.index.json" ] \
+           && ! ls "$ENG"/a/*.partial "$ENG"/b/*.partial >/dev/null 2>&1; }
+if eng_ok; then
+    say "Engram tables already extracted in $ENG"
+else
+    if [ ! -s "$FP8/model-00048-of-00048.safetensors" ] || [ ! -s "$FP8/model-00047-of-00048.safetensors" ]; then
+        need_gb 420 "the Engram shards (203 GB) plus their extraction (196 GB)"
+        run "$HF" download "$ENGRAM_REPO" model-00047-of-00048.safetensors model-00048-of-00048.safetensors \
+            model.safetensors.index.json config.json --local-dir "$FP8"
+    fi
+    run mkdir -p "$ENG/a" "$ENG/b"
+    # stdlib-only extractor from the Xolotl tree; checks sizes and spot-checks rows against the shards
+    run "$PY" -I "$XOLOTL_SRC/tools/v41/extract_engram.py" "$FP8" --to "layers.1=$ENG/a" --to "layers.14=$ENG/b"
+    if [ "$DRY" = 0 ]; then
+        eng_ok || die "Engram extraction did not finish (re-run to resume)"
+        if [ "$KEEP" = 0 ]; then say "deleting the Engram source shards ($FP8)"; rm -rf "$FP8"; fi
+    fi
+fi
+
+# ---- 3: the quant -----------------------------------------------------------------------------------------------
+GGUF_NAME="$(ls "$GSQ" 2>/dev/null | sed -n 's/^\(.*\.gguf\)\.part-[0-9]*-of-[0-9]*$/\1/p' | head -1)"
+[ -n "$GGUF_NAME" ] || GGUF_NAME="$(ls "$GSQ" 2>/dev/null | grep -E '^V41-GSQ.*\.gguf$' | grep -v MTP | head -1 || true)"
+if [ -n "$GGUF_NAME" ] && [ -s "$GSQ/$GGUF_NAME" ] && [ -e "$GSQ/.joined-ok" ]; then
+    say "the GGUF is already joined and verified: $GSQ/$GGUF_NAME"
+else
+    need_gb 175 "the quant (163 GB, its parts deleted as they are joined)"
+    # the full-precision MTP/vision sidecar (8.4 GB) is not used: DSpark runs the Q2_K one
+    run "$HF" download "$REPO" --local-dir "$GSQ" --exclude "V41-MTP-Vision.gguf" --exclude "*NEED-TO-DOWNLOAD*"
+    [ "$DRY" = 1 ] && exit 0
+    GGUF_NAME="$(ls "$GSQ" | sed -n 's/^\(.*\.gguf\)\.part-[0-9]*-of-[0-9]*$/\1/p' | head -1)"
+    [ -n "$GGUF_NAME" ] || die "no <name>.gguf.part-NN-of-MM files in $GSQ"
+    [ -s "$GSQ/SHA256SUMS" ] || die "no SHA256SUMS in $GSQ"
+
+    # ---- 4: join (what the repo's reassemble.sh does, without running a downloaded script) --------------------
+    mapfile -t parts < <(ls -1 "$GSQ/$GGUF_NAME".part-*-of-* | sort)
+    total="${parts[0]##*-of-}"
+    [ "${#parts[@]}" -eq "$((10#$total))" ] || die "found ${#parts[@]} parts, expected $total (re-run to resume the download)"
+    say "checking ${#parts[@]} parts against SHA256SUMS (a few minutes)"
+    (cd "$GSQ" && grep -E "  $GGUF_NAME\.part-" SHA256SUMS | sha256sum -c --quiet -) || die "a part is corrupt: delete it and re-run"
+    rm -f "$GSQ/$GGUF_NAME"
+    for p in "${parts[@]}"; do
+        say "appending $(basename "$p")"
+        cat "$p" >> "$GSQ/$GGUF_NAME"
+        [ "$KEEP" = 1 ] || rm -f "$p"
+    done
+    say "verifying $GGUF_NAME"
+    (cd "$GSQ" && grep -E "  $GGUF_NAME\$" SHA256SUMS | sha256sum -c -) || die "the joined GGUF does not match SHA256SUMS"
+    touch "$GSQ/.joined-ok"
+fi
+
+# ---- 5: the paths file for the start script ---------------------------------------------------------------------
+SIDECAR="$(ls "$GSQ"/*MTP*Q2_K*.gguf 2>/dev/null | head -1 || true)"
+[ -s "$GSQ/rank.bin" ] || die "no rank.bin in $GSQ"
+[ -d "$GSQ/tokenizer" ] || die "no tokenizer/ in $GSQ"
+cat > "$PATHS" <<EOF
+# written by scripts/download_dsv41 on $(date -Iseconds)
+XOLOTL_DSV41_NAME=$NAME
+XOLOTL_DSV41_REPO=$REPO
+XOLOTL_DSV41_GGUF="$GSQ/$GGUF_NAME"
+XOLOTL_DSV41_RANK="$GSQ/rank.bin"
+XOLOTL_DSV41_TOKENIZER="$GSQ/tokenizer"
+XOLOTL_DSV41_ENGRAM="$ENG/a:$ENG/b"
+XOLOTL_DSV41_DSPARK="$SIDECAR"
+EOF
+say "done: $PATHS"
+cat "$PATHS" >&2
+say "disk: $(du -sh "$GSQ" "$ENG" 2>/dev/null | awk '{print $1" "$2}' | tr '\n' ' ')"

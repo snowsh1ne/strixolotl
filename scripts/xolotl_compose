@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# scripts/xolotl_compose - run toolbox/compose.yml with the paths filled in (host side, outside the toolbox).
+#
+#   scripts/xolotl_compose up             serve DeepSeek-V4.1 on 127.0.0.1:${XOLOTL_PORT:-8150}, logs in the foreground
+#   scripts/xolotl_compose down           stop it
+#   scripts/xolotl_compose build-engine   compile the engine in the same image (= scripts/build_xolotl in the toolbox)
+#   scripts/xolotl_compose <anything>     passed to podman-compose / docker compose as is
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+export XOLOTL_REPO="$REPO"
+export XOLOTL_MODELS="${XOLOTL_MODELS:-$HOME/models/xolotl}"
+export XOLOTL_CACHE="${XOLOTL_CACHE:-$HOME/.cache/xolotl}"
+export XOLOTL_STATE="${XOLOTL_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/xolotl}"
+export XOLOTL_PORT="${XOLOTL_PORT:-8150}"
+mkdir -p "$XOLOTL_MODELS" "$XOLOTL_CACHE" "$XOLOTL_STATE"
+if command -v podman-compose >/dev/null; then
+    COMPOSE=(podman-compose)
+elif command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
+    COMPOSE=(docker compose)
+else
+    echo "need podman-compose (dnf install podman-compose) or docker compose" >&2
+    exit 1
+fi
+COMPOSE+=(-f "$REPO/toolbox/compose.yml")
+case "${1:-up}" in
+    up) shift || true; exec "${COMPOSE[@]}" up "$@" ;;
+    build-engine)
+        shift
+        exec "${COMPOSE[@]}" run --rm dsv41 "$REPO/scripts/build_xolotl" "$@" ;;
+    *) exec "${COMPOSE[@]}" "$@" ;;
+esac

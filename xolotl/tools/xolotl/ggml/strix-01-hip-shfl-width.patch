@@ -1,0 +1,14 @@
+strix-port: ggml/vendors/hip.h maps __shfl_xor_sync(mask, var, laneMask, width) with a 4-argument macro, so the
+3-argument call of xolotl-ggml.patch's warp top-k (rank argsort) does not compile for HIP. Apply after xolotl-ggml.patch.
+
+--- a/ggml/src/ggml-cuda/argsort.cu
++++ b/ggml/src/ggml-cuda/argsort.cu
+@@ -298,7 +298,7 @@
+         unsigned long long m = best;
+ #pragma unroll
+         for (int off = 16; off > 0; off >>= 1) {
+-            const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, m, off);
++            const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, m, off, WARP_SIZE);
+             m = o < m ? o : m;
+         }
+         const int col = (int) (m & 0xFFFFFFFFull);

@@ -1,0 +1,8 @@
+# scripts/verify_setup reference - written by scripts/verify_setup --record; do not edit.
+# recorded 2026-10-24 21:54:10 on strixhalo: V41-1017-GSQ-217.gguf, engine 2026-10-24 20:59:03, llama.cpp 3cf03257 + strix-01 strix-02 
+# run: greedy (--temp 0), 32 tokens, --arena-gib 80, exact routing, quality-mode env (start_xolotl_dsv41), two runs identical
+# prompt text: Write a Python function that reverses a linked list, then explain its time complexity in two sentences. (1017 encoding.py, thinking_mode=chat)
+# gguf_id = GGUF size, sha256[:16] of .experts.json and of rank.bin (GPTQ is not reproducible: a new quant needs a new reference)
+gguf_id: 243075678208 7d2c16b1db097b8a 28d9e0d46ee70ee5
+prompt: 0 128803 21750 260 15255 2019 396 127842 260 12268 2310 14 1539 8470 1009 1014 15599 295 1234 15174 16 128804 128822
+output: 5 963 1829 288 260 26747 5512 295 15255 271 9854 36490 201 3767 30337 1137 361 1351 7854 7025 16797 2161 14 1161 31 18 14 2894 36900 3395 528 2280

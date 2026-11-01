@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# scripts/build_xolotl - build the Xolotl engine for Strix Halo (HIP, gfx1151) inside the xolotl-strix toolbox.
+#
+#   scripts/build_xolotl [--clean] [--tests] [--jobs N] [--target T ...] [-- extra cmake args]
+#
+# Builds ds41_generate (the DeepSeek-V4.1 engine: ggml-hip dense half + the HIP expert tier) by default; --tests
+# builds the whole tree (all engines' CPU paths, the HIP parity tests) and runs nothing.  The llama.cpp checkout
+# (pinned commit + xolotl-ggml.patch) and the build folder live in $XOLOTL_CACHE on the local disk, not in the repo.
+. "$(dirname "$0")/lib/common.sh"
+
+CLEAN=0
+TESTS=0
+JOBS="${XOLOTL_JOBS:-$(nproc)}"
+TARGETS=()
+EXTRA=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --clean) CLEAN=1 ;;
+        --tests) TESTS=1 ;;
+        --jobs) JOBS="$2"; shift ;;
+        --target) TARGETS+=("$2"); shift ;;
+        --) shift; EXTRA=("$@"); break ;;
+        -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
+[ ${#TARGETS[@]} -gt 0 ] || TARGETS=(ds41_generate)
+
+xolotl_rocm_env
+mkdir -p "$XOLOTL_CACHE"
+
+# ---- llama.cpp at the pinned commit + Xolotl's ggml patch (as xolotl/tools/xolotl/fetch-llama.sh does) ----------
+PATCH="$XOLOTL_SRC/tools/xolotl/ggml/xolotl-ggml.patch"
+if [ ! -d "$XOLOTL_LLAMA_DIR/.git" ]; then
+    [ -e "$XOLOTL_LLAMA_DIR" ] && die "$XOLOTL_LLAMA_DIR exists and is not a git checkout - move it away"
+    say "cloning llama.cpp into $XOLOTL_LLAMA_DIR"
+    git clone -q https://github.com/ggml-org/llama.cpp.git "$XOLOTL_LLAMA_DIR"
+fi
+if git -C "$XOLOTL_LLAMA_DIR" apply --reverse --check "$PATCH" 2>/dev/null; then
+    say "llama.cpp already carries xolotl-ggml.patch"
+else
+    git -C "$XOLOTL_LLAMA_DIR" fetch -q origin "$XOLOTL_LLAMA_PIN" 2>/dev/null || git -C "$XOLOTL_LLAMA_DIR" fetch -q origin
+    git -C "$XOLOTL_LLAMA_DIR" checkout -q -f "$XOLOTL_LLAMA_PIN"
+    git -C "$XOLOTL_LLAMA_DIR" apply "$PATCH"
+    say "llama.cpp = $XOLOTL_LLAMA_PIN + xolotl-ggml.patch"
+fi
+# strix-port patches on top of xolotl-ggml.patch (none needed yet; applied in name order when present)
+for p in "$XOLOTL_SRC"/tools/xolotl/ggml/strix-*.patch; do
+    [ -e "$p" ] || continue
+    if git -C "$XOLOTL_LLAMA_DIR" apply --reverse --check "$p" 2>/dev/null; then continue; fi
+    git -C "$XOLOTL_LLAMA_DIR" apply "$p"
+    say "applied $(basename "$p")"
+done
+
+# ---- configure -------------------------------------------------------------------------------------------------
+[ "$CLEAN" = 1 ] && { say "removing $XOLOTL_BUILD_DIR"; rm -rf "$XOLOTL_BUILD_DIR"; }
+TESTS_FLAG=OFF
+[ "$TESTS" = 1 ] && TESTS_FLAG=ON
+# Strata's HIP recipe for gfx1151 (xolotl/docs/STRIX_HALO.md section 2) + Xolotl's engine options (README Quick
+# start, minus the CUDA ones): ggml-hip for the dense half, the K-quant MMQ instances the V4.1 GSQ experts need
+# (Q3_K; PTQ1_0 is transcoded to Q2_0 on the device), the fused DSV4.1 ggml ops of xolotl-ggml.patch.
+CMAKE_ARGS=(
+    -S "$XOLOTL_SRC" -B "$XOLOTL_BUILD_DIR" -G Ninja
+    -DCMAKE_BUILD_TYPE=Release
+    -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF
+    -DSTRATA_GGML_HIP=ON
+    -DSTRATA_PREFILL_MMQ=ON -DSTRATA_MMQ_KQUANTS=ON
+    -DSTRATA_DSV41_FQ_OP=ON -DSTRATA_DSV41_HC_MIX=ON
+    -DSTRATA_BUILD_TESTS="$TESTS_FLAG"
+    -DSTRATA_GGML_DIR="$XOLOTL_LLAMA_DIR"
+    -DCMAKE_HIP_ARCHITECTURES="$XOLOTL_GFX"
+    -DCMAKE_HIP_COMPILER="$XOLOTL_HIP_CLANG"
+    -DCMAKE_HIP_COMPILER_ROCM_ROOT="$XOLOTL_ROCM_ROOT"
+    "-DCMAKE_PREFIX_PATH=$XOLOTL_ROCM_PREFIX"
+    "-DCMAKE_HIP_FLAGS=--rocm-path=$XOLOTL_ROCM_ROOT --rocm-device-lib-path=$XOLOTL_ROCM_BITCODE"
+    "${EXTRA[@]}"
+)
+say "configuring $XOLOTL_BUILD_DIR (gfx $XOLOTL_GFX, ROCm ${XOLOTL_ROCM_VERSION:-?} at $XOLOTL_ROCM_ROOT)"
+mkdir -p "$XOLOTL_BUILD_DIR"
+cmake "${CMAKE_ARGS[@]}" 2>&1 | tee "$XOLOTL_BUILD_DIR/configure.log"
+[ "${PIPESTATUS[0]}" = 0 ] || die "cmake configure failed (log: $XOLOTL_BUILD_DIR/configure.log)"
+
+# ---- build -----------------------------------------------------------------------------------------------------
+if [ "$TESTS" = 1 ]; then
+    say "building everything (-j $JOBS; the first build takes 25-40 minutes)"
+    ninja -C "$XOLOTL_BUILD_DIR" -j "$JOBS" 2>&1 | tee "$XOLOTL_BUILD_DIR/build.log"
+else
+    say "building ${TARGETS[*]} (-j $JOBS; the first build takes 20-30 minutes)"
+    ninja -C "$XOLOTL_BUILD_DIR" -j "$JOBS" "${TARGETS[@]}" 2>&1 | tee "$XOLOTL_BUILD_DIR/build.log"
+fi
+[ "${PIPESTATUS[0]}" = 0 ] || die "build failed (log: $XOLOTL_BUILD_DIR/build.log)"
+
+# ---- a quick look at what came out (nothing is run on the GPU) -------------------------------------------------
+if [ -x "$XOLOTL_BUILD_DIR/ds41_generate" ]; then
+    say "built $XOLOTL_BUILD_DIR/ds41_generate"
+    if ldd "$XOLOTL_BUILD_DIR/ds41_generate" | grep -q "not found"; then
+        ldd "$XOLOTL_BUILD_DIR/ds41_generate" | grep "not found" >&2
+        die "ds41_generate has unresolved libraries"
+    fi
+    grep -q "ds41_moe_cpu" "$XOLOTL_BUILD_DIR/build.ninja" && grep -q "ds41_moe_cuda" "$XOLOTL_BUILD_DIR/build.ninja" \
+        || warn "the build has no HIP expert tier (ds41_moe_cuda): ds41_generate would run its experts on the CPU"
+fi

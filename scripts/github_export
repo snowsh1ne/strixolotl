@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# scripts/github_export - build the public GitHub copy of this repo in a staging folder on local disk, then scan it
+# for things that must not be published.  Creates no git repo and pushes nothing (docs/GITHUB_PREP.md has the steps
+# that follow, done together with the user).  The repo itself stays versioned with dv.
+#
+#   scripts/github_export [--out DIR] [--run]
+#
+#   default        dry run: what would be copied (count, size) and the scan of the SOURCE files that would go out
+#   --run          copy into DIR (default $XOLOTL_CACHE/github-export/strixolotl; replaced on every run), then scan it
+#   Exclusions: scripts/github_export.exclude (edit it to change what goes out).
+. "$(dirname "$0")/lib/common.sh"
+OUT="$XOLOTL_CACHE/github-export/strixolotl"
+RUN=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --out) OUT="$2"; shift ;;
+        --run) RUN=1 ;;
+        -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
+SRC="$XOLOTL_REPO"
+EXCL="$SRC/scripts/github_export.exclude"
+case "$OUT" in "$SRC"*) die "--out must not be inside the repo (an NFS share)" ;; esac
+PATS=$(mktemp)
+trap 'rm -f "$PATS"' EXIT
+sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$EXCL" > "$PATS"
+FILTER=(--exclude-from="$PATS")
+if [ "$RUN" = 1 ]; then
+    mkdir -p "$OUT"
+    # P .git/: the staging copy's own git repo (Claude pushes from there, docs/GITHUB_PREP.md) survives --delete
+    rsync -a --delete --delete-excluded --filter='P .git/' "${FILTER[@]}" "$SRC/" "$OUT/"
+    SCAN="$OUT"
+    say "copied to $OUT: $(find "$OUT" -type f | wc -l) files, $(du -sh "$OUT" | cut -f1)"
+else
+    LIST=$(mktemp)
+    rsync -a -n --out-format='%n' "${FILTER[@]}" "$SRC/" /tmp/github-export-dry-run-target/ | grep -v '/$' > "$LIST"
+    BYTES=$(cd "$SRC" && tr '\n' '\0' < "$LIST" | du -cb --files0-from=- 2>/dev/null | tail -1 | cut -f1)
+    say "dry run: $(wc -l < "$LIST") files, $(numfmt --to=iec "${BYTES:-0}") would be copied (--run to copy)"
+    SCAN="$SRC"
+fi
+# ---- scan: what must not go out (the dry run scans the source with the same exclusions)
+scan() {   # label, grep -E pattern
+    local hits
+    if [ "$RUN" = 1 ]; then hits=$(grep -rIEn "$2" "$SCAN" 2>/dev/null | sed "s|^$SCAN/||" || true)
+    else hits=$(cd "$SRC" && tr '\n' '\0' < "$LIST" | xargs -0 grep -IEn "$2" 2>/dev/null || true); fi
+    hits=$(echo "$hits" | grep -v '^scripts/github_export' || true)   # this script's own patterns
+    if [ -n "$hits" ]; then warn "$1: $(echo "$hits" | wc -l) lines"; echo "$hits" | cut -c1-160 | head -${SCAN_SHOW:-8}
+    else say "$1: none"; fi
+    return 0
+}
+scan "access tokens" 'hf_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_|AKIA[0-9A-Z]{16}'
+scan "Tailscale / LAN addresses" '\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+\b|\b192\.168\.[0-9]+\.[0-9]+\b'
+scan "home paths ($HOME)" "$HOME\\b"
+scan "TODO(user)" 'TODO\(user\)'
+scan "Kingston (unpublished drive numbers)" 'Kingston'
+[ "$RUN" = 1 ] || rm -f "$LIST"

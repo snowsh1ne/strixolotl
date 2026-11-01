@@ -1,0 +1,155 @@
+strix-port: ggml's HIP top_k (radix select, ncols > 1024) filled the slots left for values tied AT the k-th threshold
+in atomicAdd order, so the selected set was non-deterministic run to run.  Ties now go to the lowest column indices:
+the gather counts ties per contiguous block range, top_k_radix_fill_ties ranks them with a block scan in column order.
+HIP-only code path (no CUB on HIP); CUDA builds are unchanged.  Apply after xolotl-ggml.patch and strix-01.
+
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -146,34 +146,109 @@
+     }
+ }
+ 
++// strix-port (strix-02-topk-deterministic-ties.patch): ties AT the threshold used to take the remaining slots in
++// atomicAdd order, so the selected set changed run to run when more values tie than slots remain (e.g. -inf masked
++// entries in DeepSeek-V4.1's indexer).  Now each block owns a contiguous column range: the gather writes the
++// strictly-greater columns (order irrelevant) and counts its ties, then top_k_radix_fill_ties hands the k - greater
++// remaining slots to the tied columns in ascending column order (lowest index wins).
+ template<int BLOCK_SIZE>
+ static __global__ void top_k_radix_gather(
+         const float * __restrict__ src,
+         int * __restrict__ dst,
+         top_k_radix_state * __restrict__ states,
++        int * __restrict__ tie_counts,
+         int ncols,
+         int k,
+-        int blocks_per_row) {
++        int blocks_per_row,
++        int cols_per_block) {
+     const int row = blockIdx.x / blocks_per_row;
+     const int row_block = blockIdx.x % blocks_per_row;
+     const int tid = threadIdx.x;
+     const float * row_src = src + (size_t) row * ncols;
+     int * row_dst = dst + (size_t) row * k;
+     top_k_radix_state * state = &states[row];
++    const uint32_t prefix = state->prefix;
++    const int col_begin = row_block * cols_per_block;
++    const int col_end = min(col_begin + cols_per_block, ncols);
++
++    __shared__ int block_ties;
++    if (tid == 0) {
++        block_ties = 0;
++    }
++    __syncthreads();
+ 
+-    for (int col = row_block * BLOCK_SIZE + tid;
+-         col < ncols;
+-         col += blocks_per_row * BLOCK_SIZE) {
++    int ties = 0;
++    for (int col = col_begin + tid; col < col_end; col += BLOCK_SIZE) {
+         const uint32_t key = top_k_float_to_ordered(row_src[col]);
+-        if (key > state->prefix) {
++        if (key > prefix) {
+             const int pos = atomicAdd(&state->greater_count, 1);
+             row_dst[pos] = col;
+-        } else if (key == state->prefix) {
+-            const int pos = atomicAdd(&state->equal_count, 1);
+-            if (pos < state->rank) {
+-                row_dst[k - state->rank + pos] = col;
+-            }
++        } else if (key == prefix) {
++            ++ties;
++        }
++    }
++    if (ties > 0) {
++        atomicAdd(&block_ties, ties);
++    }
++    __syncthreads();
++    if (tid == 0) {
++        tie_counts[(size_t) row * blocks_per_row + row_block] = block_ties;
++    }
++}
++
++template<int BLOCK_SIZE>
++static __global__ void top_k_radix_fill_ties(
++        const float * __restrict__ src,
++        int * __restrict__ dst,
++        const top_k_radix_state * __restrict__ states,
++        const int * __restrict__ tie_counts,
++        int ncols,
++        int k,
++        int blocks_per_row,
++        int cols_per_block) {
++    const int row = blockIdx.x / blocks_per_row;
++    const int row_block = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int * row_ties = tie_counts + (size_t) row * blocks_per_row;
++    if (row_ties[row_block] == 0) {
++        return;
++    }
++    const uint32_t prefix = states[row].prefix;
++    const int slots = states[row].rank;   // k - (number of columns > threshold), >= 1
++
++    // ties in lower-index blocks come first (block-uniform, so the early exits below are safe)
++    int base = 0;
++    for (int b = 0; b < row_block; ++b) {
++        base += row_ties[b];
++    }
++    if (base >= slots) {
++        return;
++    }
++
++    const float * row_src = src + (size_t) row * ncols;
++    int * row_dst = dst + (size_t) row * k + (k - slots);
++    const int col_begin = row_block * cols_per_block;
++    const int col_end = min(col_begin + cols_per_block, ncols);
++
++    __shared__ int scan[BLOCK_SIZE];
++    for (int tile = col_begin; tile < col_end && base < slots; tile += BLOCK_SIZE) {
++        const int col = tile + tid;
++        const int tie = col < col_end && top_k_float_to_ordered(row_src[col]) == prefix;
++        scan[tid] = tie;
++        __syncthreads();
++        // inclusive Hillis-Steele scan over the tile, in column order
++        for (int offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
++            const int add = tid >= offset ? scan[tid - offset] : 0;
++            __syncthreads();
++            scan[tid] += add;
++            __syncthreads();
++        }
++        const int pos = base + scan[tid] - tie;
++        if (tie && pos < slots) {
++            row_dst[pos] = col;
+         }
++        base += scan[BLOCK_SIZE - 1];
++        __syncthreads();   // everyone has read scan[] before the next tile overwrites it
+     }
+ }
+ 
+@@ -184,11 +259,15 @@
+     constexpr int RADIX_BITS = 8;
+     constexpr int NBINS = 1 << RADIX_BITS;
+     const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
++    // contiguous column range per block (a multiple of BLOCK_SIZE) for the gather / tie fill
++    const int cols_per_block = ((ncols + blocks_per_row - 1) / blocks_per_row + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+ 
+     ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, nrows);
+     ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
++    ggml_cuda_pool_alloc<int> tie_counts_alloc(pool, (size_t) nrows * blocks_per_row);
+     top_k_radix_state * states = states_alloc.get();
+     int * histograms = histograms_alloc.get();
++    int * tie_counts = tie_counts_alloc.get();
+ 
+     top_k_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
+ 
+@@ -205,7 +284,10 @@
+         <<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows);
+     top_k_radix_gather<BLOCK_SIZE>
+         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+-            src, dst, states, ncols, k, blocks_per_row);
++            src, dst, states, tie_counts, ncols, k, blocks_per_row, cols_per_block);
++    top_k_radix_fill_ties<BLOCK_SIZE>
++        <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++            src, dst, states, tie_counts, ncols, k, blocks_per_row, cols_per_block);
+ }
+ 
+ #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)

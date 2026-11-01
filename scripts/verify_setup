@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# scripts/verify_setup - check that this Strix Halo box is set up as QUICKSTART.md describes, then run a short
+# deterministic generation and compare it token for token with scripts/verify_setup.ref.  Run on the host, outside
+# any toolbox (it calls `toolbox run` itself).
+#
+#   scripts/verify_setup [--full] [--record] [--no-gen] [--timeout SEC]
+#
+#   --full         also run v41_gguf.py --verify on the GGUF in xolotl-quant (~1.5 min)
+#   --record       (re)write the reference: makes the prompt with the 1017's encoding.py (xolotl-quant), runs the
+#                  generation twice, and writes scripts/verify_setup.ref only if both runs give the same tokens
+#                  (self-quantized layout only: a downloaded GSQ-217 is byte-identical to the reference's GGUF)
+#   --no-gen       skip the functional check (the static checks only; safe while a server is running)
+#   --timeout SEC  per engine run (default 600)
+#
+# Each check prints PASS / FAIL (or WARN / SKIP) and a reason; the exit code is the number of FAILs (0 = all pass).
+# The functional check refuses to start while another engine or GPU user is up or MemAvailable < 110 GiB.
+# Env: XOLOTL_MODELS, XOLOTL_BUILD_DIR, XOLOTL_CACHE (scripts/lib/common.sh), BUDGET_GIB (217: which GSQ file; the served one).
+# Two layouts, told apart by the paths file: self-quantized (QUICKSTART.md 5: the DeepSeek checkpoint + both toolboxes;
+# Engram read from the checkpoint dir) and downloaded (scripts/download_model: XOLOTL_DSV41_REPO=hf:...; no checkpoint,
+# no xolotl-quant toolbox; Engram = the two DeepSeek shards in their own dir; --full checks the GGUF's sha256).
+. "$(dirname "$0")/lib/common.sh"
+set +e   # a check that fails must not end the script (common.sh sets -e)
+
+FULL=0
+RECORD=0
+GEN=1
+TMO=600
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --full) FULL=1 ;;
+        --record) RECORD=1 ;;
+        --no-gen) GEN=0 ;;
+        --timeout) TMO="$2"; shift ;;
+        -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    shift
+done
+[ "$RECORD" = 1 ] && [ "$GEN" = 0 ] && die "--record needs the functional check (drop --no-gen)"
+[ -z "${TOOLBOX_PATH:-}" ] && [ ! -e /run/.toolboxenv ] || die "run this on the host, not inside a toolbox"
+command -v toolbox >/dev/null || die "toolbox is needed (dnf install toolbox)"
+
+# ---- what the current state is (QUICKSTART.md) -------------------------------------------------------------------
+BUDGET="${BUDGET_GIB:-217}"
+TB_STRIX=xolotl-strix
+TB_QUANT=xolotl-quant
+SRC_DIR="$XOLOTL_MODELS/DeepSeek-V4.1-Flash-1017"
+GSQ_DIR="$XOLOTL_MODELS/V41-1017-GSQ"
+GGUF="$GSQ_DIR/V41-1017-GSQ-$BUDGET.gguf"
+RANK="$GSQ_DIR/rank-$BUDGET.bin"
+TOKDIR="$GSQ_DIR/tokenizer"
+PATHS="$XOLOTL_MODELS/V41-1017.paths"
+# the tier map of the chain that made the GGUF (GSQ-217: corpus v2 chain calib-1017-v2; GSQ-200: calib-1017)
+ALLOC="$(ls "$XOLOTL_MODELS"/v41-work/calib-1017-v2/alloc_"$BUDGET".json "$XOLOTL_MODELS"/v41-work/calib-1017/alloc_"$BUDGET".json 2>/dev/null | head -1)"
+ALLOC="${ALLOC:-$XOLOTL_MODELS/v41-work/calib-1017/alloc_$BUDGET.json}"
+EXE="$XOLOTL_BUILD_DIR/ds41_generate"
+WRAPPER="$XOLOTL_SRC/tools/v41/serve/ds41-engine-strix.sh"
+PATCHDIR="$XOLOTL_SRC/tools/xolotl/ggml"
+REF="$(dirname "$0")/verify_setup.ref"
+REF="$(cd "$(dirname "$REF")" && pwd)/$(basename "$REF")"
+LAYOUT=self
+ENGRAM="$SRC_DIR"
+if [ -r "$PATHS" ] && grep -q '^XOLOTL_DSV41_REPO=hf:' "$PATHS"; then
+    LAYOUT=download
+    ENGRAM="$( . "$PATHS"; echo "$XOLOTL_DSV41_ENGRAM" )"
+fi
+# the paths file is what the server serves: when it names this budget's GGUF somewhere else (e.g. a second NVMe), the
+# checks and the engine run use its files (GGUF, rank, tokenizer, Engram)
+if [ -r "$PATHS" ]; then
+    eval "$( . "$PATHS"; printf 'P_GGUF=%q P_RANK=%q P_TOK=%q P_ENG=%q\n' "$XOLOTL_DSV41_GGUF" "$XOLOTL_DSV41_RANK" \
+        "$XOLOTL_DSV41_TOKENIZER" "$XOLOTL_DSV41_ENGRAM" )"
+    if [ "$(basename "$P_GGUF")" = "$(basename "$GGUF")" ] && [ -s "$P_GGUF" ]; then
+        GGUF="$P_GGUF"; GSQ_DIR="$(dirname "$P_GGUF")"; RANK="$P_RANK"; TOKDIR="$P_TOK"
+        [ -d "$P_ENG" ] && ENGRAM="$P_ENG"
+    fi
+fi
+[ "$RECORD" = 1 ] && [ "$LAYOUT" = download ] && die "--record needs the self-quantized layout (the DeepSeek checkpoint's encoding.py); a downloaded GSQ-217 uses the shipped reference"
+MEM_NEED=110        # GiB MemAvailable before an engine run (a killed engine frees its ~80 GiB pinned arena over seconds)
+MEM_KILL=3          # GiB: the watchdog kills the engine below this
+NGEN=32
+# the fixed prompt (rendered with the 1017's own encoding/encoding.py, chat mode, at --record time)
+PROMPT_TEXT="Write a Python function that reverses a linked list, then explain its time complexity in two sentences."
+
+NFAIL=0
+NWARN=0
+result() {   # result STATUS NAME REASON
+    local c
+    case "$1" in PASS) c='1;32' ;; FAIL) c='1;31'; NFAIL=$((NFAIL + 1)) ;; WARN) c='1;33'; NWARN=$((NWARN + 1)) ;; *) c='1;36' ;; esac
+    printf '\033[%sm%-4s\033[0m  %-16s %s\n' "$c" "$1" "$2" "$3"
+}
+pass() { result PASS "$@"; }
+fail() { result FAIL "$@"; }
+memavail() { xolotl_memavail_gib; }
+tbrun() { local tb="$1"; shift; (cd "$HOME" && toolbox run -c "$tb" "$@"); }
+
+say "verify_setup on $(uname -n): models $XOLOTL_MODELS, build $XOLOTL_BUILD_DIR, GSQ-$BUDGET, layout $LAYOUT"
+
+# ---- 1. host --------------------------------------------------------------------------------------------------------
+node=""
+for n in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+    grep -q "gfx_target_version 110501" "$n" 2>/dev/null && node="$n"
+done
+if [ -n "$node" ]; then pass host-gpu "gfx1151 KFD node $(basename "$(dirname "$node")")"
+else fail host-gpu "no gfx1151 (gfx_target_version 110501) KFD node: not a Strix Halo, or amdgpu not loaded"; fi
+if [ -r /dev/kfd ] && [ -w /dev/kfd ]; then pass host-kfd "/dev/kfd is accessible"
+else fail host-kfd "no access to /dev/kfd (render/video groups or a seat ACL)"; fi
+gtt="$(xolotl_gtt_gib)"
+if [ "$gtt" -ge 100 ]; then pass host-gtt "GTT $gtt GiB"
+else fail host-gtt "GTT $gtt GiB < 100: set amdgpu.gttsize / ttm.pages_limit on the kernel cmdline (QUICKSTART.md 1)"; fi
+ma="$(memavail)"
+if [ "$ma" -ge "$MEM_NEED" ]; then pass host-mem "MemAvailable $ma GiB"
+else result WARN host-mem "MemAvailable $ma GiB < $MEM_NEED: another model server is probably up (halogen, the xolotl server)"; fi
+ml="$(ulimit -l)"
+if [ "$ml" = unlimited ]; then pass host-memlock "memlock unlimited"
+else fail host-memlock "memlock is $ml KiB: the arena pin falls back (limits.d: * soft/hard memlock unlimited, log in again)"; fi
+
+# ---- 2. toolboxes ---------------------------------------------------------------------------------------------------
+if tbrun "$TB_STRIX" true >/dev/null 2>&1; then
+    pass tb-strix "toolbox $TB_STRIX runs"
+    out="$(tbrun "$TB_STRIX" bash -c '[ -r /opt/xolotl/rocm.env ] || { echo "no /opt/xolotl/rocm.env"; exit 1; }
+        . /opt/xolotl/rocm.env; g=$(rocminfo 2>/dev/null | grep -m1 -o gfx1151); h=$(hipconfig --version 2>/dev/null)
+        [ -n "$g" ] || { echo "rocminfo shows no gfx1151"; exit 1; }
+        echo "ROCm $XOLOTL_ROCM_VERSION at $XOLOTL_ROCM_ROOT, rocminfo $g, HIP $h, hipBLASLt $XOLOTL_HIPBLASLT_VERSION"' 2>&1)"
+    if [ $? = 0 ]; then pass tb-strix-rocm "$out"; else fail tb-strix-rocm "${out:-rocm check failed}"; fi
+else
+    fail tb-strix "toolbox $TB_STRIX missing or broken (scripts/toolbox_create)"
+    fail tb-strix-rocm "not checked (no toolbox)"
+fi
+if [ "$LAYOUT" = download ]; then
+    result SKIP tb-quant "(downloaded model: the quantization toolbox is not needed)"
+elif tbrun "$TB_QUANT" true >/dev/null 2>&1; then
+    pass tb-quant "toolbox $TB_QUANT runs"
+    out="$(tbrun "$TB_QUANT" python3 -I -c 'import torch; ok = torch.cuda.is_available(); print(torch.__version__, "hip", torch.version.hip, "cuda.is_available()", ok, torch.cuda.get_device_name(0) if ok else ""); raise SystemExit(0 if ok else 1)' 2>&1)"
+    rc=$?; out="$(echo "$out" | tail -1)"
+    if [ $rc = 0 ]; then pass tb-quant-torch "torch $out"; else fail tb-quant-torch "torch does not see the GPU: $out"; fi
+else
+    fail tb-quant "toolbox $TB_QUANT missing or broken (scripts/toolbox_create --quant)"
+    fail tb-quant-torch "not checked (no toolbox)"
+fi
+
+# ---- 3. engine build ------------------------------------------------------------------------------------------------
+if [ -x "$EXE" ]; then
+    why=""
+    tbrun "$TB_STRIX" ldd "$EXE" 2>/dev/null | grep -q "not found" && why="unresolved libraries (ldd)"
+    grep -q ds41_moe_cuda "$XOLOTL_BUILD_DIR/build.ninja" 2>/dev/null || why="${why:+$why; }no HIP expert tier (ds41_moe_cuda) in build.ninja"
+    for p in "$PATCHDIR"/xolotl-ggml.patch "$PATCHDIR"/strix-*.patch; do
+        [ "$p" -nt "$EXE" ] && why="${why:+$why; }$(basename "$p") is newer than the binary (rebuild)"
+    done
+    if [ -z "$why" ]; then pass engine "$EXE ($(date -r "$EXE" '+%F %T'))"; else fail engine "$why"; fi
+    newer="$(cd "$XOLOTL_SRC" && find src include tools/v41/engine tools/ds4 CMakeLists.txt -newer "$EXE" -type f \
+        \( -name '*.cpp' -o -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' -o -name '*.cmake' -o -name CMakeLists.txt \) 2>/dev/null | head -3 | tr '\n' ' ')"
+    [ -n "$newer" ] && result WARN engine-src "sources newer than the binary: $newer(scripts/build_xolotl)"
+else
+    fail engine "no $EXE (scripts/build_xolotl in $TB_STRIX)"
+fi
+# the llama.cpp tree must be exactly pin + xolotl-ggml.patch + strix-NN patches in order: build them into a scratch
+# index (the checkout, its index and its files stay untouched) and diff that against the working tree
+if [ -d "$XOLOTL_LLAMA_DIR/.git" ]; then
+    head="$(git -C "$XOLOTL_LLAMA_DIR" rev-parse HEAD 2>/dev/null)"
+    tmpi="$(mktemp "$XOLOTL_CACHE/verify-index.XXXXXX")"
+    why=""
+    [ "$head" = "$XOLOTL_LLAMA_PIN" ] || why="HEAD $head is not the pin $XOLOTL_LLAMA_PIN"
+    if [ -z "$why" ]; then
+        names=()
+        GIT_INDEX_FILE="$tmpi" git -C "$XOLOTL_LLAMA_DIR" read-tree "$XOLOTL_LLAMA_PIN" || why="read-tree failed"
+        for p in "$PATCHDIR"/xolotl-ggml.patch "$PATCHDIR"/strix-*.patch; do
+            [ -n "$why" ] && break
+            GIT_INDEX_FILE="$tmpi" git -C "$XOLOTL_LLAMA_DIR" apply --cached "$p" 2>/dev/null || why="$(basename "$p") does not apply on top of the previous patches"
+            names+=("$(basename "$p" .patch | cut -d- -f1-2)")
+        done
+        if [ -z "$why" ] && ! GIT_INDEX_FILE="$tmpi" git -C "$XOLOTL_LLAMA_DIR" diff --quiet; then
+            why="the tree differs from pin + patches: $(GIT_INDEX_FILE="$tmpi" git -C "$XOLOTL_LLAMA_DIR" diff --stat | tail -1) (scripts/build_xolotl re-applies them)"
+        fi
+    fi
+    rm -f "$tmpi"
+    if [ -z "$why" ]; then pass ggml-patches "llama.cpp ${XOLOTL_LLAMA_PIN:0:8} + ${names[*]} (tree matches)"
+    else fail ggml-patches "$why"; fi
+else
+    fail ggml-patches "no llama.cpp checkout at $XOLOTL_LLAMA_DIR (scripts/build_xolotl)"
+fi
+
+# ---- 4. model files -------------------------------------------------------------------------------------------------
+if [ "$LAYOUT" = download ]; then
+    # the Engram tables: the index and the two DeepSeek shards it maps, at the sizes download_model checked
+    why="$(python3 -I -c '
+import json, os, sys
+d, man = sys.argv[1], sys.argv[2]
+try:
+    wm = json.load(open(os.path.join(d, "model.safetensors.index.json")))["weight_map"]
+except OSError:
+    sys.exit(f"no model.safetensors.index.json in {d}")
+size = {s["name"]: s["size"] for s in json.load(open(man))["engram"]["shards"]} if os.path.exists(man) else {}
+for fn in sorted({v for k, v in wm.items() if ".engram.embed." in k}):
+    p = os.path.join(d, fn)
+    if not os.path.isfile(p):
+        sys.exit(f"missing {p}")
+    if fn in size and os.path.getsize(p) != size[fn]:
+        sys.exit(f"{p} is {os.path.getsize(p)} bytes, expected {size[fn]}")
+' "$ENGRAM" "$GSQ_DIR/.release/manifest.json" 2>&1)"
+    if [ -z "$why" ]; then pass engram "Engram index + shards in $ENGRAM"; else fail engram "$why (scripts/download_model)"; fi
+else
+    nok="$(ls "$SRC_DIR" 2>/dev/null | grep -c '^model-000[0-9][0-9]-of-00048\.safetensors\.ok$')"
+    why=""
+    [ "$nok" = 48 ] || why="$nok/48 shards have .ok markers (scripts/fetch_1017_fp8 --all)"
+    for f in config.json.ok model.safetensors.index.json encoding/encoding.py inference/model.py tokenizer.json; do
+        [ -e "$SRC_DIR/$f" ] || why="${why:+$why; }missing $f"
+    done
+    if [ -z "$why" ]; then pass hf-checkpoint "48/48 shards verified in $SRC_DIR"; else fail hf-checkpoint "$why"; fi
+fi
+why=""
+for f in "$GGUF" "$GGUF.experts.json" "$RANK"; do [ -s "$f" ] || why="${why:+$why; }missing $f"; done
+[ -n "$(ls -A "$TOKDIR" 2>/dev/null)" ] || why="${why:+$why; }missing or empty $TOKDIR"
+if [ -z "$why" ]; then pass gsq-files "$(basename "$GGUF") $(( $(stat -c %s "$GGUF") / 1000000000 )) GB, .experts.json, $(basename "$RANK"), tokenizer/"
+else fail gsq-files "$why"; fi
+fs="$(stat -f -c %T "$GSQ_DIR" 2>/dev/null)"
+case "$fs" in
+    btrfs) if lsattr -d "$GSQ_DIR" 2>/dev/null | awk '{print $1}' | grep -q m; then pass gsq-nocompress "$GSQ_DIR is btrfs chattr +m"
+           else fail gsq-nocompress "$GSQ_DIR is btrfs without chattr +m: compressed extents turn O_DIRECT reads into buffered ones"; fi ;;
+    nfs|nfs4|smb2|cifs|exfat|vfat|fuseblk|"") fail gsq-nocompress "$GSQ_DIR is on '${fs:-?}': models need a local ext4/btrfs/xfs NVMe" ;;
+    *) pass gsq-nocompress "$GSQ_DIR on $fs (no compression)" ;;
+esac
+if [ -r "$PATHS" ]; then
+    why="$( . "$PATHS"
+        [ "$XOLOTL_DSV41_GGUF" = "$GGUF" ] || echo "GGUF=$XOLOTL_DSV41_GGUF;"
+        [ "$XOLOTL_DSV41_RANK" = "$RANK" ] || echo "RANK=$XOLOTL_DSV41_RANK;"
+        [ "$XOLOTL_DSV41_TOKENIZER" = "$TOKDIR" ] || echo "TOKENIZER=$XOLOTL_DSV41_TOKENIZER;"
+        [ "${XOLOTL_DSV41_ENGRAM%/}" = "${ENGRAM%/}" ] || echo "ENGRAM=$XOLOTL_DSV41_ENGRAM;" )"
+    if [ -z "$why" ]; then pass paths-file "$PATHS -> $GSQ_DIR (GSQ-$BUDGET, rank, tokenizer), Engram = $([ "${ENGRAM%/}" = "${SRC_DIR%/}" ] && echo "HF checkpoint dir" || echo "$ENGRAM")"
+    else fail paths-file "$PATHS points elsewhere: $why"; fi
+else
+    fail paths-file "no $PATHS (QUICKSTART.md 5.10)"
+fi
+
+# ---- 5. optional: GGUF structure ------------------------------------------------------------------------------------
+if [ "$FULL" = 1 ] && [ "$LAYOUT" = download ]; then
+    want="$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["gguf"]["sha256"])' "$GSQ_DIR/.release/manifest.json" 2>/dev/null)"
+    if [ -n "$want" ] && [ -s "$GGUF" ]; then
+        say "sha256 of $(basename "$GGUF") (~2-4 min, reads the whole file)"
+        got="$(sha256sum "$GGUF" | cut -d' ' -f1)"
+        if [ "$got" = "$want" ]; then pass gguf-verify "sha256 matches the release manifest"; else fail gguf-verify "sha256 $got != manifest $want"; fi
+    else
+        fail gguf-verify "needs $GGUF and $GSQ_DIR/.release/manifest.json (scripts/download_model)"
+    fi
+elif [ "$FULL" = 1 ]; then
+    if [ -s "$GGUF" ] && [ -s "$ALLOC" ]; then
+        say "v41_gguf.py --verify (~1.5 min)"
+        out="$(tbrun "$TB_QUANT" bash -c ". '$XOLOTL_REPO/scripts/v41_1017.env' && python3 '$XOLOTL_SRC/tools/v41/v41_gguf.py' --verify '$GGUF' --rtn-map '$ALLOC' --experts-in-place --no-engram" 2>&1)"
+        rc=$?
+        last="$(echo "$out" | grep '^verify:' | tail -1)"; [ -n "$last" ] || last="$(echo "$out" | tail -1)"
+        if [ $rc = 0 ] && echo "$last" | grep -q " 0 problems"; then pass gguf-verify "$last"; else fail gguf-verify "rc=$rc: $last"; fi
+    else
+        fail gguf-verify "needs $GGUF and $ALLOC"
+    fi
+else
+    result SKIP gguf-verify "(--full)"
+fi
+
+# ---- 6. functional check: a deterministic greedy generation vs the reference ----------------------------------------
+gpu_users() {   # PIDs with a KFD (GPU) context, as "pid:comm"
+    local p
+    for p in $(ls /sys/class/kfd/kfd/proc 2>/dev/null); do printf '%s:%s ' "$p" "$(ps -o comm= -p "$p" 2>/dev/null)"; done
+}
+busy_reason() {
+    local r="" m u
+    pgrep -x ds41_generate >/dev/null && r="a ds41_generate engine is running (pid $(pgrep -x ds41_generate | tr '\n' ' '))"
+    pgrep -f serve_ds41.py >/dev/null && r="${r:+$r; }the xolotl server (serve_ds41.py) is running"
+    u="$(gpu_users)"; [ -n "$u" ] && r="${r:+$r; }GPU in use by $u"
+    m="$(memavail)"; [ "$m" -lt "$MEM_NEED" ] && r="${r:+$r; }MemAvailable $m GiB < $MEM_NEED (another model server up?)"
+    echo "$r"
+}
+wait_idle() {   # up to $1 s for the previous engine's pinned memory to come back
+    local i
+    for i in $(seq 1 $(( $1 / 2 ))); do [ -z "$(busy_reason)" ] && return 0; sleep 2; done
+    [ -z "$(busy_reason)" ]
+}
+
+# run_engine IDS_CSV OUT LOG -> rc; stdout (one token id per line) to OUT, the engine log to LOG
+run_engine() {
+    local ids="$1" out="$2" log="$3" wd mw rc inner
+    wd="$(dirname "$out")/watchdog.log"
+    : > "$wd"; rm -f "$wd.min"
+    (   # memory watchdog: kill the engine before the box runs out (strixite saw hard hangs near 0 free)
+        min=999
+        while :; do
+            m="$(memavail)"; [ "$m" -lt "$min" ] && { min=$m; echo "min $min" > "$wd.min"; }
+            if [ "$m" -lt "$MEM_KILL" ]; then echo "WATCHDOG: MemAvailable $m GiB - killed ds41_generate" >> "$wd"; pkill -KILL -x ds41_generate; fi
+            sleep 1
+        done
+    ) &
+    mw=$!
+    # quality mode as scripts/start_xolotl_dsv41 sets it (lossless + the four fidelity switches), plus a FIXED arena so
+    # the expert placement (and with strix-02 the whole computation) is identical run to run; no --arena-adapt
+    inner="$(printf '%q ' env STRATA_BUILD_DIR="$XOLOTL_BUILD_DIR" STRATA_DENSE_REQUANT= STRATA_UMA_ZEROCOPY=1 STRATA_PF_NO_DUMMY=1 \
+        STRATA_DBG_OQUANT=1 STRATA_IDX_BF16=1 STRATA_DBG_PREC32=1 STRATA_DENSE_F16=output.weight \
+        STRATA_HIPBLASLT_TUNING="$XOLOTL_SRC/tools/hip/gfx1151-hipblaslt-100401.txt" \
+        "$WRAPPER" -m "$GGUF" --rank "$RANK" --engram "$ENGRAM" \
+        --backend cuda --experts gpu --uma on --pcie 1 --tier-batch-pcie 1 \
+        --arena-gib 80 --uma-reserve-gib 24 --uma-cache-gib 0 --pf-b 0 --no-chunk-mmq --kv-fp4 \
+        --route-bias 0 --route-bias-file 0 --prompt-batch 8192 --ctx 8192 --temp 0 -n "$NGEN" --ids "$ids")"
+    timeout "$TMO" toolbox run -c "$TB_STRIX" bash -c ". /opt/xolotl/rocm.env; $inner > $(printf %q "$out") 2> $(printf %q "$log")" < /dev/null
+    rc=$?
+    pkill -KILL -x ds41_generate 2>/dev/null   # on a timeout `timeout` only ends toolbox run, not the engine inside
+    kill "$mw" 2>/dev/null; wait "$mw" 2>/dev/null
+    [ $rc = 124 ] && echo "TIMEOUT after $TMO s" >> "$wd"
+    return $rc
+}
+ids_of() { grep -E '^[0-9]+$' "$1" | tr '\n' ' ' | sed 's/ $//'; }
+gguf_id() { echo "$(stat -c %s "$GGUF") $(sha256sum "$GGUF.experts.json" | cut -c1-16) $(sha256sum "$RANK" | cut -c1-16)"; }
+summary() {   # one line from an engine log
+    local l="$1" load arena dec zc
+    load="$(grep -o 'loaded in [0-9.]* s' "$l" | head -1)"
+    arena="$(grep -o 'tier: .*seeded' "$l" | sed 's/tier: //; s/[;,] seeded//' | head -1)"
+    dec="$(grep -o 'decode: [0-9]* tokens in [0-9.]* s = [0-9.]* tok/s' "$l" | sed 's/decode: //' | tail -1)"
+    grep -q 'arena: zero-copy' "$l" && zc=", zero-copy" || zc=", NO zero-copy"
+    echo "$load; $arena$zc; decode $dec"
+}
+
+if [ "$GEN" = 0 ]; then
+    result SKIP gen "(--no-gen)"
+else
+    busy="$(busy_reason)"
+    pre=""
+    for f in "$EXE" "$GGUF" "$RANK"; do [ -e "$f" ] || pre="${pre:+$pre; }missing $f"; done
+    [ "$RECORD" = 0 ] && [ ! -r "$REF" ] && pre="${pre:+$pre; }no reference $REF (scripts/verify_setup --record)"
+    if [ -n "$busy" ]; then
+        fail gen "REFUSED, not started: $busy. Stop the server / other model first (no engine was run)."
+    elif [ -n "$pre" ]; then
+        fail gen "$pre"
+    else
+        RUN="$XOLOTL_CACHE/verify/$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$RUN"
+        if [ "$RECORD" = 1 ]; then
+            say "rendering the prompt with $SRC_DIR/encoding/encoding.py ($TB_QUANT)"
+            cat > "$RUN/mkprompt.py" <<'EOF'
+import importlib.util, sys
+from tokenizers import Tokenizer
+src, text = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("enc", f"{src}/encoding/encoding.py")
+E = importlib.util.module_from_spec(spec); spec.loader.exec_module(E)
+p = E.encode_messages([{"role": "user", "content": text}], thinking_mode="chat")
+print(",".join(str(i) for i in Tokenizer.from_file(f"{src}/tokenizer.json").encode(p, add_special_tokens=False).ids))
+EOF
+            prompt="$(tbrun "$TB_QUANT" python3 -I "$RUN/mkprompt.py" "$SRC_DIR" "$PROMPT_TEXT" 2>"$RUN/mkprompt.err" | tail -1)"
+            if ! echo "$prompt" | grep -qE '^[0-9]+(,[0-9]+)+$'; then
+                fail gen "could not render the prompt: $(tail -1 "$RUN/mkprompt.err")"
+                prompt=""
+            fi
+        else
+            prompt="$(sed -n 's/^prompt: //p' "$REF" | tr ' ' ',')"
+            want="$(sed -n 's/^output: //p' "$REF")"
+            want_id="$(sed -n 's/^gguf_id: //p' "$REF")"
+        fi
+        if [ -n "$prompt" ]; then
+            runs=1; [ "$RECORD" = 1 ] && runs=2
+            ok=1
+            for r in $(seq 1 $runs); do
+                [ "$r" -gt 1 ] && { say "waiting for the first run's memory to come back"; wait_idle 240 || { fail gen "memory did not come back after run 1: $(busy_reason)"; ok=0; break; }; }
+                say "engine run $r/$runs: $NGEN greedy tokens, arena 80 GiB, quality mode (~2-3 min; log $RUN/run$r.log)"
+                t0=$(date +%s)
+                run_engine "$prompt" "$RUN/run$r.ids" "$RUN/run$r.log"
+                rc=$?
+                got="$(ids_of "$RUN/run$r.ids")"
+                n=$(echo "$got" | wc -w)
+                if [ $rc != 0 ] || [ "$n" != "$NGEN" ]; then
+                    fail gen "run $r: rc=$rc, $n/$NGEN tokens ($(cat "$RUN/watchdog.log" 2>/dev/null | tail -1)) $(grep -v '^$' "$RUN/run$r.log" | tail -1 | cut -c1-200)"
+                    ok=0; break
+                fi
+                say "run $r: $(( $(date +%s) - t0 )) s, $(summary "$RUN/run$r.log"), min MemAvailable $(cut -d' ' -f2 "$RUN/watchdog.log.min" 2>/dev/null) GiB"
+                eval "got$r=\"\$got\""
+            done
+            if [ "$ok" = 1 ] && [ "$RECORD" = 1 ]; then
+                if [ "$got1" != "$got2" ]; then
+                    fail gen "NOT deterministic: run 1 and run 2 differ - no reference written ($RUN)"
+                else
+                    {
+                        echo "# scripts/verify_setup reference - written by scripts/verify_setup --record; do not edit."
+                        echo "# recorded $(date '+%F %T') on $(uname -n): $(basename "$GGUF"), engine $(date -r "$EXE" '+%F %T'), llama.cpp ${XOLOTL_LLAMA_PIN:0:8} + $(cd "$PATCHDIR" && ls strix-*.patch | cut -d- -f1-2 | tr '\n' ' ')"
+                        echo "# run: greedy (--temp 0), $NGEN tokens, --arena-gib 80, exact routing, quality-mode env (start_xolotl_dsv41), two runs identical"
+                        echo "# prompt text: $PROMPT_TEXT (1017 encoding.py, thinking_mode=chat)"
+                        echo "# gguf_id = GGUF size, sha256[:16] of .experts.json and of rank.bin (GPTQ is not reproducible: a new quant needs a new reference)"
+                        echo "gguf_id: $(gguf_id)"
+                        echo "prompt: ${prompt//,/ }"
+                        echo "output: $got1"
+                    } > "$REF"
+                    pass gen "recorded $REF: two runs identical ($NGEN tokens)"
+                fi
+            elif [ "$ok" = 1 ]; then
+                if [ "$got1" = "$want" ]; then
+                    pass gen "$NGEN/$NGEN tokens identical to the reference"
+                else
+                    i=0; first=""
+                    read -r -a A <<< "$got1"; read -r -a B <<< "$want"
+                    for i in $(seq 0 $((NGEN - 1))); do [ "${A[$i]:-}" != "${B[$i]:-}" ] && { first=$i; break; }; done
+                    note=""; [ "$(gguf_id)" != "$want_id" ] && note=" - the reference was recorded on a different GGUF/rank.bin (re-record with --record)"
+                    fail gen "differs from the reference at token $first (got ${A[$first]:-none}, want ${B[$first]:-none})$note; ids in $RUN/run1.ids"
+                fi
+            fi
+        fi
+    fi
+fi
+
+# ---- summary --------------------------------------------------------------------------------------------------------
+if [ "$NFAIL" = 0 ]; then say "all checks passed$([ "$NWARN" -gt 0 ] && echo " ($NWARN warning(s))")"; else warn "$NFAIL check(s) FAILED"; fi
+exit "$NFAIL"
