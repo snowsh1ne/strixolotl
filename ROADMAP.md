@@ -20,7 +20,7 @@ repo.
 | Quality, 17 held-out 8K rows | same output distribution as plain | ppl gap to the teacher +1.61%, top-1 agreement 0.874 |
 
 Model: GSQ-217, our own quantization of DeepSeek-V4.1-Flash-1017. It is 243.1 GB: 99.4% of the routed experts are
-Q3_K, the dense half is Q8_0. Download: [Snowsh1ne/DeepSeek-V4.1-Flash-1017-GSQ-217-Strixolotl](https://huggingface.co/Snowsh1ne/DeepSeek-V4.1-Flash-1017-GSQ-217-Strixolotl).
+Q3_K (~3.44 bits per weight, from DeepSeek's native MXFP4 at ~4.25), the dense half is Q8_0: a 3-bit-class quant. Download: [Snowsh1ne/DeepSeek-V4.1-Flash-1017-GSQ-217-Strixolotl](https://huggingface.co/Snowsh1ne/DeepSeek-V4.1-Flash-1017-GSQ-217-Strixolotl).
 
 ## Defaults and switches
 
@@ -59,7 +59,8 @@ it (DSpark).
 
 ## Quality A/B (17 held-out rows)
 
-Same text through the engine and through the unquantized FP8 teacher: 17 held-out sequences of 8K tokens, not used
+Same text through the engine and through the teacher (DeepSeek's official checkpoint run in torch: FP8 weights,
+natively FP4 experts): 17 held-out sequences of 8K tokens, not used
 for calibration. Per-token NLL and argmax vs the teacher, pooled over all positions.
 
 | Configuration | ppl gap to the teacher | top-1 agreement |
@@ -83,6 +84,10 @@ for calibration. Per-token NLL and argmax vs the teacher, pooled over all positi
 
 - Xolotl's GPTQ-style pipeline. Every routed expert gets its own format from calibration statistics (tiers from
   ternary PTQ1_0 to Q3_K); the dense half stays Q8_0.
+- The checkpoint already ships its routed experts as MXFP4 (~4.25 bits, quantization-aware trained), so a "Q4" file
+  of this model is essentially the original. GSQ-217 goes below that, to ~3.44 bits: compare it with 3-bit-class
+  quants. No head-to-head against other GGUFs of this model has been measured; the 17-row A/B also includes engine
+  numerics noise, so its top-1 figure is not comparable to other projects' published ones.
 - Proxy curve (whole model, error vs all-Q2_0): 170 GiB −33%, 200 −71%, 217 −85%; no knee at 170, the deep layers
   gain most from Q3_K. 217 GiB is the ceiling of what the expert tier can serve on this box.
 - Corpus v2: 48 sequences x 8,192 tokens (agentic_long 18, agent 4, code 8, reason 6, web 2, zh 3, chat 4, multi 3),

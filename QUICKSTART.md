@@ -136,7 +136,7 @@ What it does (details in the script header):
 
 On btrfs it sets `chattr +m` on `$G` and `$M/V41-1017-Engram` before writing (no root needed). Then go to section 6.
 
-### 4.2 Path B: download the FP8 checkpoint (host or a toolbox)
+### 4.2 Path B: download the official checkpoint (host or a toolbox)
 
 ```bash
 cd $REPO

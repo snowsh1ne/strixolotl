@@ -20,7 +20,7 @@ NVMe. The server starts with the full 1,048,576-token context.
 All numbers come from one box: Minisforum MS-S1 MAX, Ryzen AI MAX+ 395, 128 GB, Fedora 43, ROCm 7.14.1, model on a
 Samsung 990 Pro 1 TB NVMe (PCIe 4.0 x4, ~6 GB/s on expert reads). Details, dates and the roadmap: [ROADMAP.md](ROADMAP.md).
 
-**Quality** (same-text engine A/B, 17 held-out 8K-token rows, teacher-forced against the unquantized FP8 checkpoint,
+**Quality** (same-text engine A/B, 17 held-out 8K-token rows, teacher-forced against DeepSeek's official checkpoint (FP8 weights, natively FP4 experts),
 2026-10-23):
 
 | | ppl gap to the teacher | top-1 agreement with the teacher |
@@ -94,7 +94,7 @@ DSpark), so there is no separate speed mode; see [SSD_SPEED.md](SSD_SPEED.md).
 1. **Download the prequantized model** (recommended): `scripts/download_model --repo Snowsh1ne/DeepSeek-V4.1-Flash-1017-GSQ-217-Strixolotl`
    fetches GSQ-217 from [Hugging Face](https://huggingface.co/Snowsh1ne/DeepSeek-V4.1-Flash-1017-GSQ-217-Strixolotl) in verified parts, plus only the two Engram
    shards of DeepSeek's checkpoint. No quantization.
-2. **Or quantize it yourself:** download the 510 GB FP8 checkpoint, calibrate (~12.5 h) and run the GSQ quant pass
+2. **Or quantize it yourself:** download the 510 GB official checkpoint, calibrate (~12.5 h) and run the GSQ quant pass
    (~8.7 h). GPTQ is not bit-reproducible, so this gives an equivalent file, not the released one.
 
 Then `scripts/verify_setup` checks the box and runs a 32-token generation that must match `scripts/verify_setup.ref`

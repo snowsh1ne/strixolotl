@@ -55,7 +55,7 @@ against the sha256 values in `engram/README.md`. The other 46 shards of the 510 
 | | |
 |---|---|
 | Method | GSQ: Xolotl's GPTQ-style pipeline (`tools/v41/`). Every routed expert gets its own format from calibration statistics. Tiers: PTQ1_0 (ternary, 1.75 bpw), Q2_0 (2.25 bpw), Q3_K. |
-| This file | 217 GiB of routed experts, 99.4% Q3_K. 217 GiB is the ceiling of these tiers. |
+| This file | 217 GiB of routed experts, 99.4% Q3_K (~3.44 bpw, from the checkpoint's native MXFP4 experts at ~4.25 bpw): a 3-bit-class quant. 217 GiB is the ceiling of these tiers. |
 | Dense half | Q8_0 (attention, router, shared expert; quality mode keeps it at Q8_0) |
 | Calibration | 48 sequences x 8,192 tokens: agentic_long 18, agent 4, code 8, reason 6, web 2, zh 3, chat 4, multi 3. Sources: real-world agentic coding workflows (multi-turn tool use), antirez/ds4's imatrix prompts, Chinese Wikipedia, pile-10k. Calibration run `calib-1017-v2`, quant run `quant-1017-217`. |
 | Teacher | The FP8/FP4 checkpoint `deepseek-ai/DeepSeek-V4.1-Flash-1017`, run layer by layer in torch |
@@ -73,7 +73,7 @@ own next-token distribution. Engine in quality mode, fixed 82 GiB arena, 2026-10
 | Earlier quant GSQ-200, without the fidelity switches | +2.74% | 0.854 |
 | **This quant, GSQ-217, quality mode** | **+1.61%** | **0.874** (higher on 16 of 17 rows) |
 
-For scale: two runs of the unquantized teacher with different sampling seeds (temperature 1, top_p 0.95) pick the
+For scale: two runs of the teacher with different sampling seeds (temperature 1, top_p 0.95) pick the
 same token at 0.71 of the positions. Top-1 agreement is the more stable signal; single-text perplexity on this model
 moves by several percent from small numeric changes.
 
