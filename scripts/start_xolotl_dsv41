@@ -214,11 +214,17 @@ export STRATA_TEXT_LOG="$TEXT_LOG"
 tail -n 0 -F "$LOG" &
 TAIL=$!
 trap 'kill "$TAIL" 2>/dev/null' EXIT
-trap 'kill -INT "$SRV" 2>/dev/null' INT TERM
+# Ctrl+C (and TERM, or HUP when the terminal closes) stops the whole server. Forward TERM, not INT: bash starts a
+# background job with SIGINT ignored and Python keeps an inherited SIG_IGN, so an INT left the front end running after
+# this script was gone. The front end turns SIGTERM into its Ctrl+C path (QUIT to the engine, which frees its memory);
+# a second Ctrl+C kills the engine at once.
+trap 'kill -TERM "$SRV" 2>/dev/null' INT TERM HUP
 "${SERVE[@]}" &
 SRV=$!
-wait "$SRV"
-RC=$?
-# a second wait: the INT trap above interrupts the first one
-wait "$SRV" 2>/dev/null || true
+RC=0
+# every trapped signal interrupts wait: keep waiting until the front end has really exited
+while kill -0 "$SRV" 2>/dev/null; do
+    wait "$SRV"
+    RC=$?
+done
 exit "$RC"
